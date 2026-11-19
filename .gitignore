@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Data, models, and run outputs stay local
+data/*
+!data/.gitkeep
+*.jsonl
+*.parquet
+*.pkl
+*.pt
+*.ckpt
+outputs/
+wandb/
+
+# Secrets
+.env
+
+# OS and editors
+.DS_Store
+.vscode/
+.idea/
