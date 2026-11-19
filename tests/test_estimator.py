@@ -3,7 +3,7 @@ import random
 
 import pytest
 
-from roulette_eval import load_trajectories, rr_estimate, sample_stop_step
+from shortstop import load_trajectories, rr_estimate, sample_stop_step
 
 
 def exact_expectation(f, p):
