@@ -8,7 +8,7 @@ Notation, for a run of T steps:
 from __future__ import annotations
 
 import random
-from typing import Sequence
+from collections.abc import Sequence
 
 
 def sample_stop_step(p: Sequence[float], rng: random.Random) -> int:
