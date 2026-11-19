@@ -17,6 +17,7 @@ python coverage/standin_predictor.py     # add --split temporal for the second s
 python coverage/experiments.py           # same flag
 python coverage/plots.py                 # same flag
 python coverage/optimal_policy.py        # about 1 minute
+python coverage/adaptive.py --floor 0.2  # about 5 minutes
 ```
 
 | File | What it does |
@@ -27,6 +28,7 @@ python coverage/optimal_policy.py        # about 1 minute
 | `stopping.py` | Deterministic stopping, the randomized policies, the estimator and its exact variance |
 | `experiments.py` | Coverage and cost of every method, per agent |
 | `optimal_policy.py` | Fits four stopping policies on the other agents and compares them |
+| `adaptive.py` | Corrects the predictor during the evaluation from the agent's own results |
 | `plots.py` | The two-panel headline figure |
 
 ## Data
@@ -125,6 +127,43 @@ runs.
 - No fitted policy fixes the two weak agents. Their cost comes from the step-0 prediction
   being far from the agent's true rate, which a policy fitted on other agents cannot see.
 
+**Correcting the predictor during the evaluation** (`adaptive.py`). Tasks are evaluated
+in batches of 25. Before each batch, all predictions are shifted on the logit scale so
+that the step-0 predictions on tasks seen so far average to the current estimate of the
+agent's score. The shift uses only earlier batches, so the estimate stays unbiased
+(largest bias over 37 agents: 0.6 points). Tracking policy with kappa = 0.25:
+
+| Floor on reach probability | Method | Median compute | Worst agent | Mean coverage | Worst coverage |
+| --- | --- | --- | --- | --- | --- |
+| 0.05 | static | 52% | 5.6x | 94.5% | 91.9% |
+| 0.05 | adaptive | 56% | 1.2x | 92.4% | 86.2% |
+| 0.1 | static | 57% | 5.2x | 94.7% | 92.6% |
+| 0.1 | adaptive | 53% | 1.3x | 93.7% | 91.6% |
+| 0.2 | static | 61% | 4.0x | 94.9% | 91.6% |
+| 0.2 | adaptive | 56% | 1.2x | 94.3% | 91.6% |
+
+- **It fixes the weak agents.** The worst case drops from 4 to 5.6 times full-run compute
+  to about 1.2 times, and only one agent (9% resolve rate) is still above full runs.
+- **It costs coverage unless the floor is raised.** At floor 0.05 the intervals cover
+  92.4% on average and 86% for the weakest agent. The estimate is unbiased, so my reading
+  is that the interval is too narrow: once the corrected predictor is confident, few runs
+  are finished and a handful of heavily weighted ones carry the variance. I have not
+  verified that cause directly.
+- **Floor 0.2 with correction is the best setting so far**: 56% median compute, 1.2x worst
+  case, 94.3% coverage. A 0.6 point gap to the static method remains.
+- Compute here is measured from the spread of simulated estimates (800 replicates at
+  floor 0.05, 500 at the others), so each number carries a few percent of noise.
+
+**Where the learned tracking rule comes from.** For one run, the variance added by
+stopping is Σ_k D_k / P_k with D_k = (Y − f_{k−1})² − (Y − f_k)², and the expected cost is
+Σ_k c_k P_k. Suppose that from step k on the reach probability is held at one value P.
+The D_k from k onward sum to (Y − f_{k−1})², so the trade-off is (Y − f_{k−1})² / P +
+λ · (remaining cost) · P, minimized at P = sqrt(E[(Y − f_{k−1})²] / (λ E[remaining cost])).
+Learned tracking applies this at every step with both expectations measured on training
+agents, and takes the running minimum. It is therefore the best policy among those that
+plan to hold the probability constant from now on, re-planned at each step. The full
+optimum may also plan future decreases, so it can only continue at least as often.
+
 ## What this does not show yet
 
 - The step schedule is a numerical optimum over step number only, and the two tracking
@@ -132,9 +171,8 @@ runs.
   at every step. A policy that is optimal over the full state is still not derived.
   `stopping.exact_moments` gives the variance and expected cost it needs:
   Var = Σ_k [(Y − f_{k−1})² − (Y − f_k)²] / P(reach k) − (Y − f_0)².
-- Weak agents cost more than full runs. The likely fix is to update the predictor from
-  the agent's own finished runs as the evaluation proceeds; that changes the interval
-  argument and is not implemented.
+- The adaptive correction still leaves a small coverage gap, and the interval under it
+  needs a martingale argument rather than the independent-tasks one.
 - Intervals are plain normal intervals with no proof behind them yet.
 - Leave-one-agent-out keeps other versions of the same model in training, and policy
   tables are built from predictions whose models saw the held-out agent.
