@@ -47,7 +47,8 @@ def main() -> None:
     families = [("deterministic", "Deterministic stopping", ORANGE),
                 ("tracking", "Randomized (ours)", BLUE)]
     for prefix, label, color in families:
-        rows = results[results["method"].str.startswith(prefix)]
+        rows = results[results["method"].str.startswith(prefix)
+                       & ~results["method"].str.contains("floor")]
         left.scatter(100 * rows["cost_fraction"], 100 * rows["coverage"], s=9, color=color,
                      alpha=0.18, linewidths=0)
         mean = rows.groupby("method", sort=False)[["cost_fraction", "coverage"]].mean()
@@ -69,7 +70,7 @@ def main() -> None:
 
     # Right: compute for a fixed interval width, per randomized policy.
     rows = results[(results["kind"] == "randomized") & (results["method"] != "full runs")]
-    rows = rows[~rows["method"].str.startswith("randomized threshold")]
+    rows = rows[~rows["method"].str.contains("randomized threshold|floor")]
     order = rows.groupby("method", sort=False)["relative_compute"].median().sort_values().index
     for i, method in enumerate(order):
         values = 100 * rows.loc[rows["method"] == method, "relative_compute"]

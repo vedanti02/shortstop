@@ -34,6 +34,9 @@ for q in [0.2, 0.5]:
 for kappa in [0.5, 1.0, 1.5, 2.0, 3.0]:
     METHODS[f"tracking kappa={kappa}"] = (
         "randomized", lambda F, kappa=kappa: stopping.reach_tracking(F, kappa, 0.05))
+# A lower floor allows weights up to 100, a stress test for the normal interval.
+METHODS["tracking kappa=0.5 floor=0.01"] = (
+    "randomized", lambda F: stopping.reach_tracking(F, 0.5, 0.01))
 
 
 def pad_runs(agent_rows: pd.DataFrame):
@@ -59,27 +62,32 @@ def interval_stats(estimates: np.ndarray, target: float) -> dict:
             "rmse": float(np.sqrt(((mean - target) ** 2).mean()))}
 
 
-def evaluate_agent(F: np.ndarray, cost: np.ndarray, replicates: int, rng) -> list[dict]:
-    n = len(F)
+def sample_estimates(F: np.ndarray, reach: np.ndarray, idx: np.ndarray, rng) -> np.ndarray:
+    """Randomized-truncation estimates for the resampled tasks idx (replicates, n)."""
+    table = stopping.estimate_table(F, reach)
+    estimates = np.empty(idx.shape)
+    for start in range(0, len(idx), 50):  # chunked to bound memory
+        rows_idx = idx[start:start + 50]
+        steps = stopping.sample_stop_steps(reach[rows_idx], rng.random(rows_idx.shape))
+        estimates[start:start + 50] = table[rows_idx, steps]
+    return estimates
+
+
+def evaluate_agent(F: np.ndarray, cost: np.ndarray, replicates: int, rng,
+                   n_tasks: int | None = None, methods: dict | None = None) -> list[dict]:
     y = F[:, -1]
     target = y.mean()
     full_cost = cost.sum(axis=1).mean()
-    idx = rng.integers(0, n, (replicates, n))
+    idx = rng.integers(0, len(F), (replicates, n_tasks or len(F)))
     rows = []
-    for name, (kind, fn) in METHODS.items():
+    for name, (kind, fn) in (methods or METHODS).items():
         if kind == "deterministic":
             label, paid = fn(F, cost)
             stats = interval_stats(label[idx], target)
             mean_cost, variance = paid.mean(), label.var()
         else:
             reach = fn(F)
-            table = stopping.estimate_table(F, reach)
-            estimates = np.empty((replicates, n))
-            for start in range(0, replicates, 50):  # chunked to bound memory
-                rows_idx = idx[start:start + 50]
-                steps = stopping.sample_stop_steps(reach[rows_idx], rng.random(rows_idx.shape))
-                estimates[start:start + 50] = table[rows_idx, steps]
-            stats = interval_stats(estimates, target)
+            stats = interval_stats(sample_estimates(F, reach, idx, rng), target)
             run_var, run_cost = stopping.exact_moments(F, cost, reach)
             mean_cost, variance = run_cost.mean(), y.var() + run_var.mean()
         rows.append({"method": name, "kind": kind, "true_rate": target, **stats,
@@ -94,6 +102,7 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("data/swebench_verified"))
     parser.add_argument("--split", choices=["loao", "temporal"], default="loao")
     parser.add_argument("--replicates", type=int, default=2000)
+    parser.add_argument("--tasks", type=int, help="tasks per replicate (default: all)")
     args = parser.parse_args()
 
     predictions = pd.read_pickle(args.data / f"predictions_{args.split}.pkl")
@@ -101,11 +110,12 @@ def main() -> None:
     rows = []
     for agent, agent_rows in predictions.groupby("agent", sort=True):
         F, cost = pad_runs(agent_rows)
-        rows += [{"agent": agent, **r} for r in evaluate_agent(F, cost, args.replicates, rng)]
+        rows += [{"agent": agent, **r} for r in evaluate_agent(F, cost, args.replicates, rng, args.tasks)]
         print(f"done {agent}", flush=True)
 
     results = pd.DataFrame(rows)
-    out = Path(__file__).parent / "results" / f"results_{args.split}.csv"
+    suffix = f"_n{args.tasks}" if args.tasks else ""
+    out = Path(__file__).parent / "results" / f"results_{args.split}{suffix}.csv"
     out.parent.mkdir(exist_ok=True)
     results.to_csv(out, index=False)
 

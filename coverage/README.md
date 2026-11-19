@@ -16,6 +16,7 @@ python coverage/features.py              # about 4 minutes
 python coverage/standin_predictor.py     # add --split temporal for the second split
 python coverage/experiments.py           # same flag
 python coverage/plots.py                 # same flag
+python coverage/optimal_policy.py        # about 1 minute
 ```
 
 | File | What it does |
@@ -25,6 +26,7 @@ python coverage/plots.py                 # same flag
 | `standin_predictor.py` | Logistic regression that scores each agent without having seen it |
 | `stopping.py` | Deterministic stopping, the randomized policies, the estimator and its exact variance |
 | `experiments.py` | Coverage and cost of every method, per agent |
+| `optimal_policy.py` | Fits four stopping policies on the other agents and compares them |
 | `plots.py` | The two-panel headline figure |
 
 ## Data
@@ -85,14 +87,54 @@ Stand-in predictor, leave-one-agent-out, 37 agents. Full tables are in `results/
 
 ![Headline figure](results/headline_loao.png)
 
+## Follow-up checks
+
+**Smaller task sets.** With 100 tasks per replicate (`experiments.py --tasks 100`), the
+randomized methods cover 94.2% to 94.7% on average and full runs cover 94.4%; the worst
+single agent is 92.0% against 92.6% for full runs. Lowering the probability floor from
+0.05 to 0.01 changes nothing measurable. The normal interval is about as good with
+randomized stopping as without it.
+
+**Is the baseline at EarlyEval's operating point?** Their abstract reports 13% to 26% of
+steps removed, up to 44% of input tokens, and resolve rates shifting 1 to 2 points on
+average. Deterministic 0.05/0.95 here saves 33% of tokens with a 1.1 point mean shift, so
+it sits in the same region, and that is the row where coverage is 87.5%. Their classifier
+(paired LightGBM models with reference-solution features) is stronger than this stand-in,
+so this is a matched operating point, not a reproduction.
+
+**Fitted policies** (`optimal_policy.py`, results in `results/policy_loao.csv`). Each
+policy is fitted on the other 36 agents to minimize variance x expected cost, then scored
+on the held-out agent. Numbers are compute for a fixed interval width relative to full
+runs.
+
+| Policy | Median | Worst agent | Agents worse than full runs | Compute used |
+| --- | --- | --- | --- | --- |
+| One-shot, q tuned | 55% | 4.9x | 3 | 5% |
+| Tracking, kappa tuned | 53% | 5.3x | 2 | 7% |
+| Step schedule, optimized | 58% | 4.3x | 2 | 7% |
+| Learned tracking, kappa tuned | 52% | 3.9x | 2 | 7% |
+
+- All four land between 52% and 58%. With this predictor the best policy is close to
+  "finish about 1 run in 15 and use the step-0 prediction for the rest": per-step
+  stopping adds about 3 points over one-shot.
+- One-shot and learned tracking tune to the lowest setting allowed by the 0.05 floor, so
+  the floor, not the policy shape, is what binds.
+- The gain from stopping inside a run therefore depends on a predictor whose estimate
+  moves during the run. That is the learned predictor's job; this stand-in mostly knows
+  task difficulty.
+- No fitted policy fixes the two weak agents. Their cost comes from the step-0 prediction
+  being far from the agent's true rate, which a policy fitted on other agents cannot see.
+
 ## What this does not show yet
 
-- The baseline is deterministic stopping with my stand-in predictor and my thresholds,
-  not EarlyEval's classifier at its operating point. The coverage loss is real for this
-  setup; how it compares to their reported 1-point shift is open.
-- The tracking rule is a heuristic, not a derived optimum. The cost-optimal policy is
-  still to do; `stopping.exact_moments` gives the variance and expected cost it needs:
+- The step schedule is a numerical optimum over step number only, and the two tracking
+  rules come from the one-shot optimum q ∝ sqrt(squared error / remaining cost) applied
+  at every step. A policy that is optimal over the full state is still not derived.
+  `stopping.exact_moments` gives the variance and expected cost it needs:
   Var = Σ_k [(Y − f_{k−1})² − (Y − f_k)²] / P(reach k) − (Y − f_0)².
-- Intervals are plain normal intervals. They cover here, but weights reach 1 / 0.05, so
-  smaller task sets or a lower floor should be checked before claiming validity in general.
-- Leave-one-agent-out keeps other versions of the same model in training.
+- Weak agents cost more than full runs. The likely fix is to update the predictor from
+  the agent's own finished runs as the evaluation proceeds; that changes the interval
+  argument and is not implemented.
+- Intervals are plain normal intervals with no proof behind them yet.
+- Leave-one-agent-out keeps other versions of the same model in training, and policy
+  tables are built from predictions whose models saw the held-out agent.
