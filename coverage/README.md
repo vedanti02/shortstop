@@ -1,6 +1,7 @@
 # coverage (Vedanti)
 
-The finding, the estimator, and the confidence intervals.
+The finding, the estimator, and the confidence intervals. The derivation of the optimal
+stopping policy and the argument for the intervals are in [THEORY.md](THEORY.md).
 
 - Data: SWE-bench Verified submissions (many agents, same tasks)
 - Stand-in: simple predictor (logistic regression on step count and test-run features)
@@ -13,11 +14,11 @@ From the repo root, with the environment active:
 ```bash
 python coverage/download_swebench.py     # about 30 minutes, 13 GB streamed, 410 MB kept
 python coverage/features.py              # about 4 minutes
-python coverage/standin_predictor.py     # add --split temporal for the second split
+python coverage/standin_predictor.py     # --split temporal or --split lofo for the others
 python coverage/experiments.py           # same flag
 python coverage/plots.py                 # same flag
 python coverage/optimal_policy.py        # about 1 minute
-python coverage/adaptive.py --floor 0.2  # about 5 minutes
+python coverage/adaptive.py --floor 0.2 --prior 50   # about 15 minutes
 ```
 
 | File | What it does |
@@ -27,7 +28,7 @@ python coverage/adaptive.py --floor 0.2  # about 5 minutes
 | `standin_predictor.py` | Logistic regression that scores each agent without having seen it |
 | `stopping.py` | Deterministic stopping, the randomized policies, the estimator and its exact variance |
 | `experiments.py` | Coverage and cost of every method, per agent |
-| `optimal_policy.py` | Fits four stopping policies on the other agents and compares them |
+| `optimal_policy.py` | Fits five stopping policies on the other agents and compares them |
 | `adaptive.py` | Corrects the predictor during the evaluation from the agent's own results |
 | `plots.py` | The two-panel headline figure |
 
@@ -61,8 +62,9 @@ the target.
 - **Randomized threshold**: at the deterministic rule's trigger, continue with
   probability 0.2 instead of stopping.
 
-Two splits for the predictor: `loao` trains on every other agent, `temporal` trains only
-on agents submitted earlier (31 agents have at least 5 earlier ones).
+Three splits for the predictor: `loao` trains on every other agent, `temporal` trains only
+on agents submitted earlier (31 agents have at least 5 earlier ones), and `lofo` leaves out
+every agent from the same vendor as the one being scored.
 
 ## Results so far
 
@@ -115,8 +117,9 @@ runs.
 | Tracking, kappa tuned | 53% | 5.3x | 2 | 7% |
 | Step schedule, optimized | 58% | 4.3x | 2 | 7% |
 | Learned tracking, kappa tuned | 52% | 3.9x | 2 | 7% |
+| Index (the derived optimum), kappa tuned | 54% | 4.4x | 2 | 6% |
 
-- All four land between 52% and 58%. With this predictor the best policy is close to
+- All five land between 52% and 58%. With this predictor the best policy is close to
   "finish about 1 run in 15 and use the step-0 prediction for the rest": per-step
   stopping adds about 3 points over one-shot.
 - One-shot and learned tracking tune to the lowest setting allowed by the 0.05 floor, so
@@ -124,6 +127,12 @@ runs.
 - The gain from stopping inside a run therefore depends on a predictor whose estimate
   moves during the run. That is the learned predictor's job; this stand-in mostly knows
   task difficulty.
+- **The derived optimum does not beat learned tracking here.** THEORY.md shows the optimal
+  policy follows an index: the best ratio of expected error removed to expected cost over
+  every look-ahead horizon. Learned tracking is the horizon "to the end of the run". On
+  this data the two are within noise (54% against 52% held out; 55.7% against 55.4% when
+  fitted and scored on all agents), because the largest drop in error comes when the
+  tests reveal the outcome, so the end of the run is already the best horizon.
 - No fitted policy fixes the two weak agents. Their cost comes from the step-0 prediction
   being far from the agent's true rate, which a policy fitted on other agents cannot see.
 
@@ -144,35 +153,60 @@ agent's score. The shift uses only earlier batches, so the estimate stays unbias
 
 - **It fixes the weak agents.** The worst case drops from 4 to 5.6 times full-run compute
   to about 1.2 times, and only one agent (9% resolve rate) is still above full runs.
-- **It costs coverage unless the floor is raised.** At floor 0.05 the intervals cover
-  92.4% on average and 86% for the weakest agent. The estimate is unbiased, so my reading
-  is that the interval is too narrow: once the corrected predictor is confident, few runs
-  are finished and a handful of heavily weighted ones carry the variance. I have not
-  verified that cause directly.
-- **Floor 0.2 with correction is the best setting so far**: 56% median compute, 1.2x worst
-  case, 94.3% coverage. A 0.6 point gap to the static method remains.
-- Compute here is measured from the spread of simulated estimates (800 replicates at
-  floor 0.05, 500 at the others), so each number carries a few percent of noise.
+- **It costs coverage at a low floor.** At floor 0.05 the intervals cover 92.4% on average
+  and 86% for the weakest agent.
+- **The cause is skew, not a wrong variance.** The estimated variance of the mean matches
+  its true variance on average (`variance_ratio` between 0.91 and 1.07 for every agent),
+  but the intervals miss more often on one side. Once the corrected predictor is
+  confident, few runs are finished and a handful of heavily weighted ones make the
+  estimate skewed. THEORY.md gives the rate: the coverage error scales with
+  1 / sqrt(n x floor), so what matters is the number of finished runs.
+- Rows above use 500 to 800 replicates, so each number carries a few percent of noise.
 
-**Where the learned tracking rule comes from.** For one run, the variance added by
-stopping is Σ_k D_k / P_k with D_k = (Y − f_{k−1})² − (Y − f_k)², and the expected cost is
-Σ_k c_k P_k. Suppose that from step k on the reach probability is held at one value P.
-The D_k from k onward sum to (Y − f_{k−1})², so the trade-off is (Y − f_{k−1})² / P +
-λ · (remaining cost) · P, minimized at P = sqrt(E[(Y − f_{k−1})²] / (λ E[remaining cost])).
-Learned tracking applies this at every step with both expectations measured on training
-agents, and takes the running minimum. It is therefore the best policy among those that
-plan to hold the probability constant from now on, re-planned at each step. The full
-optimum may also plan future decreases, so it can only continue at least as often.
+**Damped correction** (`--prior 50`, 1,500 replicates). The first batches give a noisy
+estimate of the agent's score, and correcting toward it at full strength pushes the
+predictor to extremes. Here the uncorrected predictor keeps the weight of 50 tasks when
+the shift is computed.
+
+| Floor | Method | Median compute | Worst agent | Mean coverage | Worst coverage |
+| --- | --- | --- | --- | --- | --- |
+| 0.1 | static | 56% | 4.2x | 94.6% | 93.3% |
+| 0.1 | adaptive, damped | 51% | 1.4x | 94.0% | 93.0% |
+| 0.2 | static | 61% | 3.9x | 94.9% | 94.0% |
+| 0.2 | adaptive, damped | 55% | 1.3x | 94.6% | 93.5% |
+
+- **Recommended setting: damped correction with floor 0.2.** 55% median compute, 1.3x in
+  the worst case, 94.6% coverage against 94.8% for full runs, and no agent below 93.5%.
+  Largest bias over 37 agents: 0.2 points.
+- With damping the corrected method is cheaper than the static one for the typical agent
+  as well as the weak ones.
+- Hall's skewness-corrected interval was also tried on five agents and did not help
+  consistently, so the interval stays the plain normal one.
+
+**Leakage check** (`--split lofo`). Leave-one-agent-out keeps other models from the same
+vendor in training (12 OpenAI agents, 8 Anthropic). Leaving the whole vendor out instead:
+
+| | Leave one agent out | Leave one vendor out |
+| --- | --- | --- |
+| Deterministic 0.05/0.95, mean coverage | 87.5% | 85.3% |
+| Deterministic 0.05/0.95, agents below 90% | 6 of 37 | 9 of 37 |
+| Deterministic 0.05/0.95, mean abs. bias | 1.1 pts | 1.6 pts |
+| Randomized methods, mean coverage | 94.8% to 95.0% | 94.7% to 95.0% |
+| Randomized methods, worst single agent | 93.4% | 93.0% |
+| Tracking kappa = 0.5, median compute | 55% | 55% |
+
+The finding does not depend on same-vendor models being in training. The baseline gets
+slightly worse without them and the randomized estimators do not change.
 
 ## What this does not show yet
 
-- The step schedule is a numerical optimum over step number only, and the two tracking
-  rules come from the one-shot optimum q ∝ sqrt(squared error / remaining cost) applied
-  at every step. A policy that is optimal over the full state is still not derived.
-  `stopping.exact_moments` gives the variance and expected cost it needs:
-  Var = Σ_k [(Y − f_{k−1})² − (Y − f_k)²] / P(reach k) − (Y − f_0)².
-- The adaptive correction still leaves a small coverage gap, and the interval under it
-  needs a martingale argument rather than the independent-tasks one.
-- Intervals are plain normal intervals with no proof behind them yet.
-- Leave-one-agent-out keeps other versions of the same model in training, and policy
-  tables are built from predictions whose models saw the held-out agent.
+- THEORY.md is a set of proof sketches from standard theorems, checked numerically but not
+  reviewed by anyone else. The interval result is asymptotic; the finite-sample statement
+  is a rate, not a guarantee.
+- The index policy is estimated on a coarse state (step, prediction decile). It has not
+  been tried with a predictor that changes its mind during a run, which is the only case
+  where it can beat learned tracking.
+- One agent (9% resolve rate) still needs more compute than full runs under every setting.
+- Policy tables are built from predictions whose models saw the held-out agent. The
+  vendor-out split addresses the predictor, not this.
+- 13 older submissions have estimated token counts.

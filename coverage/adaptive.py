@@ -25,7 +25,7 @@ import pandas as pd
 import stopping
 from experiments import Z, pad_runs
 
-KAPPA, P_MIN = 0.25, 0.05
+KAPPA, P_MIN, PRIOR_TASKS = 0.25, 0.05, 0.0
 
 
 def sigmoid(x):
@@ -43,7 +43,9 @@ def solve_delta(logit0: np.ndarray, target: np.ndarray) -> np.ndarray:
 
 
 def simulate(F, cost, replicates: int, batch: int, adapt: bool, rng,
-             kappa: float = KAPPA, p_min: float = P_MIN) -> dict:
+             kappa: float = KAPPA, p_min: float = P_MIN, prior_tasks: float = 0.0) -> dict:
+    """Simulated evaluations of one agent. prior_tasks is how many tasks' worth of weight
+    the uncorrected predictor keeps when the correction is computed."""
     n, T = cost.shape
     y = F[:, -1]
     logits = np.log(np.clip(F[:, :-1], 1e-4, 1 - 1e-4) / (1 - np.clip(F[:, :-1], 1e-4, 1 - 1e-4)))
@@ -64,7 +66,10 @@ def simulate(F, cost, replicates: int, batch: int, adapt: bool, rng,
         paid[:, start:start + batch] = paid_table[tasks.ravel(), steps].reshape(tasks.shape)
         if adapt:
             seen = idx[:, :start + batch]
-            target = np.clip(estimates[:, :start + batch].mean(axis=1), 0.01, 0.99)
+            seen_n = start + batch
+            prior = sigmoid(logits[seen, 0]).mean(axis=1)  # what the predictor said unshifted
+            target = (estimates[:, :seen_n].sum(axis=1) + prior_tasks * prior) / (seen_n + prior_tasks)
+            target = np.clip(target, 0.01, 0.99)
             delta = solve_delta(logits[seen, 0], target)
 
     mean = estimates.mean(axis=1)
@@ -72,6 +77,11 @@ def simulate(F, cost, replicates: int, batch: int, adapt: bool, rng,
     full_variance, full_cost = y.var() / n, cost.sum(axis=1).mean()
     return {"coverage": float((np.abs(mean - y.mean()) <= half).mean()),
             "bias": float(mean.mean() - y.mean()),
+            # share of intervals entirely below / above the target
+            "miss_below": float((mean + half < y.mean()).mean()),
+            "miss_above": float((mean - half > y.mean()).mean()),
+            # average estimated variance of the mean over its true variance; 1 is ideal
+            "variance_ratio": float(((half / Z) ** 2).mean() / mean.var()),
             "cost_fraction": float(paid.mean() / full_cost),
             "relative_compute": float(mean.var() * paid.mean() / (full_variance * full_cost)),
             "final_delta": float(np.median(delta))}
@@ -80,11 +90,13 @@ def simulate(F, cost, replicates: int, batch: int, adapt: bool, rng,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--data", type=Path, default=Path("data/swebench_verified"))
-    parser.add_argument("--split", choices=["loao", "temporal"], default="loao")
+    parser.add_argument("--split", choices=["loao", "temporal", "lofo"], default="loao")
     parser.add_argument("--replicates", type=int, default=800)
     parser.add_argument("--batch", type=int, default=25)
     parser.add_argument("--kappa", type=float, default=KAPPA)
     parser.add_argument("--floor", type=float, default=P_MIN, help="lowest reach probability")
+    parser.add_argument("--prior", type=float, default=PRIOR_TASKS,
+                        help="tasks' worth of weight kept on the uncorrected predictor")
     args = parser.parse_args()
 
     predictions = pd.read_pickle(args.data / f"predictions_{args.split}.pkl")
@@ -93,20 +105,23 @@ def main() -> None:
     for agent, agent_rows in predictions.groupby("agent", sort=True):
         F, cost = pad_runs(agent_rows)
         for name, adapt in [("static", False), ("adaptive", True)]:
-            stats = simulate(F, cost, args.replicates, args.batch, adapt, rng, args.kappa, args.floor)
+            stats = simulate(F, cost, args.replicates, args.batch, adapt, rng, args.kappa, args.floor,
+                             args.prior)
             rows.append({"agent": agent, "method": name, "true_rate": F[:, -1].mean(), **stats})
         print(f"done {agent}: static {rows[-2]['relative_compute']:.2f}, "
               f"adaptive {rows[-1]['relative_compute']:.2f}", flush=True)
 
     results = pd.DataFrame(rows)
     suffix = "" if (args.kappa, args.floor) == (KAPPA, P_MIN) else f"_k{args.kappa}_f{args.floor}"
+    suffix += f"_m{args.prior:g}" if args.prior else ""
     out = Path(__file__).parent / "results" / f"adaptive_{args.split}{suffix}.csv"
     results.to_csv(out, index=False)
     summary = results.groupby("method", sort=False).agg(
         median=("relative_compute", "median"), worst=("relative_compute", "max"),
         worse_than_full=("relative_compute", lambda r: int((r > 1).sum())),
         cost_fraction=("cost_fraction", "mean"), coverage=("coverage", "mean"),
-        worst_coverage=("coverage", "min"), max_abs_bias=("bias", lambda b: b.abs().max()))
+        worst_coverage=("coverage", "min"), max_abs_bias=("bias", lambda b: b.abs().max()),
+        variance_ratio=("variance_ratio", "mean"))
     print(summary.round(3).to_string())
     print(f"wrote {out}")
 

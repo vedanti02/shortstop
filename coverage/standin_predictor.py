@@ -2,6 +2,7 @@
 
     python coverage/standin_predictor.py                   # leave the evaluated agent out
     python coverage/standin_predictor.py --split temporal  # train only on earlier agents
+    python coverage/standin_predictor.py --split lofo      # leave the whole model vendor out
 
 Each agent is scored by a model that never saw it. One feature, task_rate, is how often the
 training agents solved the task, which is known before a new agent is run.
@@ -23,6 +24,15 @@ from sklearn.preprocessing import StandardScaler
 LOGGED = ["k", "tokens_so_far", "test_runs", "edits", "errors", "nonzero_exits", "tests_passed"]
 MAX_TRAIN_ROWS = 300_000
 MIN_TRAIN_AGENTS = 5
+# Keyword in the agent name -> vendor. Agents from one vendor share models or model lineage.
+VENDORS = {"claude": "anthropic", "sonnet": "anthropic", "gemini": "google", "gpt": "openai",
+           "o3-": "openai", "o4-": "openai", "qwen": "qwen", "kimi": "kimi", "glm": "glm",
+           "minimax": "minimax", "deepseek": "deepseek", "devstral": "mistral"}
+
+
+def vendor(agent: str) -> str:
+    model = agent.split("_", 2)[2]
+    return next(v for key, v in VENDORS.items() if key in model)
 
 
 def design(rows: pd.DataFrame, task_rate: pd.Series) -> np.ndarray:
@@ -53,7 +63,7 @@ def predict_agent(features: pd.DataFrame, outcomes: pd.DataFrame, agent: str,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--data", type=Path, default=Path("data/swebench_verified"))
-    parser.add_argument("--split", choices=["loao", "temporal"], default="loao")
+    parser.add_argument("--split", choices=["loao", "temporal", "lofo"], default="loao")
     args = parser.parse_args()
 
     features = pd.read_pickle(args.data / "features.pkl")
@@ -67,6 +77,8 @@ def main() -> None:
     for agent in agents:
         if args.split == "loao":
             train_agents = [a for a in agents if a != agent]
+        elif args.split == "lofo":
+            train_agents = [a for a in agents if vendor(a) != vendor(agent)]
         else:
             train_agents = [a for a in agents if a[:8] < agent[:8]]
         if len(train_agents) < MIN_TRAIN_AGENTS:

@@ -4,7 +4,7 @@
 
 The quantity minimized is variance x expected cost per task, relative to full runs: the
 compute needed to reach a given interval width. Every policy is fitted on the other
-agents and scored on the held-out one. Four policies are compared:
+agents and scored on the held-out one. Five policies are compared:
 
     one-shot           finish the run with probability q                    (q tuned)
     tracking           reach = kappa * sqrt(f (1 - f))                      (kappa tuned)
@@ -15,6 +15,12 @@ agents and scored on the held-out one. Four policies are compared:
     learned tracking   reach = kappa * sqrt(E[(Y - f)^2 | state] / E[remaining cost | state])
                        with both expectations measured on the training agents, so it
                        does not assume the predictor is calibrated            (kappa tuned)
+    index              reach = kappa * sqrt(index of the state), where the index is the
+                       best ratio, over every rule for when to stop looking ahead, of the
+                       expected drop in squared error to the expected cost. This is the
+                       optimal policy when the state is Markov (see THEORY.md); learned
+                       tracking is the special case that always looks ahead to the end
+                                                                              (kappa tuned)
 
 Output: coverage/results/policy_<split>.csv
 """
@@ -35,6 +41,9 @@ STEP_EDGES = np.array([0, 1, 2, 3, 5, 7, 10, 14, 19, 26, 35, 47, 63, 84, 112, 15
 F_EDGES = np.linspace(0, 1, 11)[1:-1]
 KAPPAS = [0.1, 0.15, 0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0, 3.0]
 QS = [0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7]
+INDEX_KAPPAS = list(np.geomspace(0.02, 3.0, 14).round(4))
+MU_GRID = np.geomspace(1e-4, 1e4, 193)  # candidate index values, in units of 1 / mean run cost
+SHRINK = 20.0  # runs' worth of pull toward the step average, for sparsely visited states
 
 
 def relative_compute(F, cost, reach) -> float:
@@ -117,6 +126,56 @@ def reach_learned(F, table: np.ndarray, kappa: float) -> np.ndarray:
     return np.minimum.accumulate(np.clip(kappa * table[cell], P_MIN, 1.0), axis=1)
 
 
+# --- index policy ---------------------------------------------------------------------------
+
+
+def index_stats(F, cost, lengths, T_max: int) -> dict:
+    """Sums by (step, prediction bin) for runs still going, and transitions to the next bin."""
+    T = cost.shape[1]
+    alive = np.arange(T)[None, :] < lengths[:, None]
+    sq = (F[:, -1:] - F) ** 2
+    bins = np.digitize(F[:, :-1], F_EDGES)
+    step = np.broadcast_to(np.arange(T), bins.shape)
+    cell = (step * 10 + bins)[alive]
+    both = alive[:, :-1] & alive[:, 1:]
+    pair = (step[:, :-1] * 100 + bins[:, :-1] * 10 + bins[:, 1:])[both]
+    return {"drop": np.bincount(cell, (sq[:, :-1] - sq[:, 1:])[alive], T_max * 10).reshape(T_max, 10),
+            "spend": np.bincount(cell, cost[alive], T_max * 10).reshape(T_max, 10),
+            "count": np.bincount(cell, minlength=T_max * 10).reshape(T_max, 10).astype(float),
+            "trans": np.bincount(pair, minlength=T_max * 100).reshape(T_max, 10, 10).astype(float)}
+
+
+def fit_index_table(stats: list[dict], shrink: float = SHRINK) -> np.ndarray:
+    """Index of each (step, prediction bin) state, by backward induction.
+
+    For a price mu per unit of cost, M[state] is the best expected value of
+    (drop in squared error - mu * cost) over the next steps, stopping the look-ahead when
+    it turns negative. The index is the price at which M is zero.
+    """
+    drop, spend, count, trans = (sum(s[key] for s in stats) for key in ("drop", "spend", "count", "trans"))
+    spend = spend / (spend.sum() / count[0].sum())  # cost in units of the mean run cost
+    index = np.zeros(count.shape)
+    M = np.zeros((10, len(MU_GRID)))
+    for k in reversed(range(len(count))):
+        total = drop[k][:, None] - spend[k][:, None] * MU_GRID + trans[k] @ np.maximum(M, 0)
+        step_mean = total.sum(axis=0) / max(count[k].sum(), 1.0)
+        M = (total + shrink * step_mean) / np.maximum(count[k][:, None] + shrink, 1e-12)
+        # M decreases in mu and is piecewise linear: interpolate its zero crossing.
+        last = (M > 0).sum(axis=1) - 1
+        lo, hi = np.clip(last, 0, len(MU_GRID) - 2), np.clip(last, 0, len(MU_GRID) - 2) + 1
+        rows = np.arange(10)
+        m_lo, m_hi = M[rows, lo], M[rows, hi]
+        crossing = MU_GRID[lo] + m_lo * (MU_GRID[hi] - MU_GRID[lo]) / np.maximum(m_lo - m_hi, 1e-300)
+        index[k] = np.where(last < 0, 0.0, np.where(last >= len(MU_GRID) - 1, MU_GRID[-1], crossing))
+    return index
+
+
+def reach_index(F, index: np.ndarray, kappa: float, p_min: float = P_MIN) -> np.ndarray:
+    T = F.shape[1] - 1
+    target = kappa * np.sqrt(index[np.arange(T)[None, :], np.digitize(F[:, :-1], F_EDGES)])
+    return np.minimum.accumulate(np.clip(target, p_min, 1.0), axis=1)
+
+
 # --- leave-one-agent-out comparison --------------------------------------------------------
 
 
@@ -127,7 +186,7 @@ def geo_mean(values) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--data", type=Path, default=Path("data/swebench_verified"))
-    parser.add_argument("--split", choices=["loao", "temporal"], default="loao")
+    parser.add_argument("--split", choices=["loao", "temporal", "lofo"], default="loao")
     parser.add_argument("--replicates", type=int, default=1000)
     args = parser.parse_args()
 
@@ -139,6 +198,8 @@ def main() -> None:
     agents = list(runs)
     sched = {a: schedule_stats(*runs[a]) for a in agents}
     state = {a: state_stats(*runs[a], lengths[a]) for a in agents}
+    T_max = max(runs[a][1].shape[1] for a in agents)
+    index = {a: index_stats(*runs[a], lengths[a], T_max) for a in agents}
 
     # Policies with no fitted table score the same whichever agent is held out.
     one_shot = {a: [relative_compute(*runs[a], stopping.reach_one_shot(runs[a][0], q))
@@ -152,7 +213,7 @@ def main() -> None:
         train = [a for a in agents if a != held_out]
         F, cost = runs[held_out]
 
-        def tuned(scores: dict) -> int:
+        def tuned(scores: dict, train=train) -> int:
             """Index of the setting with the best geometric-mean score on the training agents."""
             return int(np.argmin([geo_mean([scores[a][i] for a in train])
                                   for i in range(len(scores[train[0]]))]))
@@ -164,14 +225,20 @@ def main() -> None:
         learned_scores = {a: [relative_compute(*runs[a], reach_learned(runs[a][0], table, k))
                               for k in KAPPAS] for a in train}
         learned_kappa = KAPPAS[tuned(learned_scores)]
+        index_table = fit_index_table([index[a] for a in train])
+        index_scores = {a: [relative_compute(*runs[a], reach_index(runs[a][0], index_table, k))
+                            for k in INDEX_KAPPAS] for a in train}
+        index_kappa = INDEX_KAPPAS[tuned(index_scores)]
 
         policies = {
             "one-shot": stopping.reach_one_shot(F, q),
             "tracking": stopping.reach_tracking(F, kappa, P_MIN),
             "step schedule": reach_schedule(F, schedule),
             "learned tracking": reach_learned(F, table, learned_kappa),
+            "index": reach_index(F, index_table, index_kappa),
         }
-        settings = {"one-shot": q, "tracking": kappa, "learned tracking": learned_kappa}
+        settings = {"one-shot": q, "tracking": kappa, "learned tracking": learned_kappa,
+                    "index": index_kappa}
         idx = rng.integers(0, len(F), (args.replicates, len(F)))
         for name, reach in policies.items():
             _, expected_cost = stopping.exact_moments(F, cost, reach)

@@ -35,7 +35,7 @@ def style(ax):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--split", choices=["loao", "temporal"], default="loao")
+    parser.add_argument("--split", choices=["loao", "temporal", "lofo"], default="loao")
     args = parser.parse_args()
     folder = Path(__file__).parent / "results"
     results = pd.read_csv(folder / f"results_{args.split}.csv")

@@ -100,7 +100,7 @@ def evaluate_agent(F: np.ndarray, cost: np.ndarray, replicates: int, rng,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--data", type=Path, default=Path("data/swebench_verified"))
-    parser.add_argument("--split", choices=["loao", "temporal"], default="loao")
+    parser.add_argument("--split", choices=["loao", "temporal", "lofo"], default="loao")
     parser.add_argument("--replicates", type=int, default=2000)
     parser.add_argument("--tasks", type=int, help="tasks per replicate (default: all)")
     args = parser.parse_args()
