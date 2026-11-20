@@ -19,6 +19,7 @@ python coverage/experiments.py           # same flag
 python coverage/plots.py                 # same flag
 python coverage/optimal_policy.py        # about 1 minute
 python coverage/adaptive.py --floor 0.2 --prior 50   # about 15 minutes
+python coverage/midrun_signal.py         # about 25 minutes
 ```
 
 | File | What it does |
@@ -29,6 +30,7 @@ python coverage/adaptive.py --floor 0.2 --prior 50   # about 15 minutes
 | `stopping.py` | Deterministic stopping, the randomized policies, the estimator and its exact variance |
 | `experiments.py` | Coverage and cost of every method, per agent |
 | `optimal_policy.py` | Fits five stopping policies on the other agents and compares them |
+| `midrun_signal.py` | Controlled check of the index policy with a predictor that is given a signal mid-run |
 | `adaptive.py` | Corrects the predictor during the evaluation from the agent's own results |
 | `plots.py` | The two-panel headline figure |
 
@@ -133,6 +135,12 @@ runs.
   this data the two are within noise (54% against 52% held out; 55.7% against 55.4% when
   fitted and scored on all agents), because the largest drop in error comes when the
   tests reveal the outcome, so the end of the run is already the best horizon.
+- **It does win when the predictor learns early in the run** (`midrun_signal.py`). With
+  the same runs and costs but a predictor shown the outcome with 90% accuracy a tenth of
+  the way in, the index policy needs 42% against 54% for learned tracking and is better
+  for 33 of 37 agents. At a quarter of the way in it is 47% against 54%; at halfway they
+  tie. With a 75%-accurate signal it is slightly worse (50% against 48%). The signal is
+  artificial, so this shows when the rule can pay off, not that it will.
 - No fitted policy fixes the two weak agents. Their cost comes from the step-0 prediction
   being far from the agent's true rate, which a policy fitted on other agents cannot see.
 
@@ -200,12 +208,11 @@ slightly worse without them and the randomized estimators do not change.
 
 ## What this does not show yet
 
-- THEORY.md is a set of proof sketches from standard theorems, checked numerically but not
-  reviewed by anyone else. The interval result is asymptotic; the finite-sample statement
-  is a rate, not a guarantee.
-- The index policy is estimated on a coarse state (step, prediction decile). It has not
-  been tried with a predictor that changes its mind during a run, which is the only case
-  where it can beat learned tracking.
+- THEORY.md was revised after one outside read-through, but nobody has verified it line by
+  line. The interval result is asymptotic; the finite-sample statement is a heuristic.
+- The index policy is estimated on a coarse state (step, prediction decile). It beats
+  learned tracking only with an artificial early signal, and not yet with a real
+  predictor.
 - One agent (9% resolve rate) still needs more compute than full runs under every setting.
 - Policy tables are built from predictions whose models saw the held-out agent. The
   vendor-out split addresses the predictor, not this.
