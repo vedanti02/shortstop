@@ -250,6 +250,8 @@ def agent_rows(path: Path, chunk: int = 200_000) -> pd.DataFrame:
         rows += run_rows(steps, _GOLD.get(key.split("@")[0]))
     if rows:
         frames.append(_frame(rows))
+    if not frames:  # e.g. a CoderForge shard whose tasks were all from Verified repositories
+        return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
     df[["task_id", "agent"]] = df[["task_id", "agent"]].astype(str)
     return df
@@ -270,7 +272,8 @@ def main() -> None:
     with Pool(args.workers, initializer=_init, initargs=(gold,)) as pool:
         frames = []
         for path, df in zip(paths, pool.imap(agent_rows, paths)):
-            frames.append(df)
+            if len(df):
+                frames.append(df)
             print(f"{path.name}: {len(df)} rows", flush=True)
     features = pd.concat(frames, ignore_index=True)
     out = args.out or args.data / "features_rich.pkl"

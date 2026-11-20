@@ -48,15 +48,21 @@ MAX_ROUNDS = 2000
 N_VALID_AGENTS = 4
 
 
+def task_of(rows: pd.DataFrame) -> pd.Series:
+    """The task a row belongs to: task_id without the "@<run>" suffix of repeated runs."""
+    return rows["task"] if "task" in rows else rows["task_id"]
+
+
 def add_task_rate(rows: pd.DataFrame, outcomes: pd.DataFrame, train_agents: list[str],
                   leave_own_out: bool) -> pd.Series:
     """Leave-one-out solve rate. Leaks the row's own outcome once the model can identify the
-    task (rate is lower exactly when the run passed), so training uses crossfit_task_rate."""
+    task (rate is lower exactly when the run passed), so training uses crossfit_task_rate.
+    With repeated runs, outcomes holds each agent's mean over its runs of the task."""
     solved = outcomes[train_agents]
     total, n = solved.sum(axis=1), len(train_agents)
     if leave_own_out:
-        return (rows["task_id"].map(total) - rows["outcome"]) / (n - 1)
-    return rows["task_id"].map(total / n)
+        return (task_of(rows).map(total) - rows["outcome"]) / (n - 1)
+    return task_of(rows).map(total / n)
 
 
 def crossfit_task_rate(rows: pd.DataFrame, outcomes: pd.DataFrame, train_agents: list[str],
@@ -73,7 +79,7 @@ def crossfit_task_rate(rows: pd.DataFrame, outcomes: pd.DataFrame, train_agents:
     rate = pd.Series(np.nan, index=rows.index)
     for mine, other in [(halves[0], halves[1]), (halves[1], halves[0])]:
         is_mine = rows["agent"].isin(mine)
-        rate[is_mine] = rows.loc[is_mine, "task_id"].map(outcomes[other].mean(axis=1))
+        rate[is_mine] = task_of(rows.loc[is_mine]).map(outcomes[other].mean(axis=1))
     return rate
 
 
@@ -146,9 +152,11 @@ def main() -> None:
     args = parser.parse_args()
 
     features = pd.read_pickle(args.data / "features_rich.pkl")
-    outcomes = features[features["k"] == 0].pivot(index="task_id", columns="agent", values="outcome")
+    features["task"] = features["task_id"].str.split("@").str[0]  # repeated runs share a task
+    outcomes = features[features["k"] == 0].pivot_table(index="task", columns="agent",
+                                                        values="outcome", aggfunc="mean")
     outcomes = outcomes.dropna()
-    features = features[features["task_id"].isin(outcomes.index)]
+    features = features[features["task"].isin(outcomes.index)]
     weights = pd.read_pickle(args.weights).reindex(features.index) if args.weights else None
     agents = sorted(outcomes.columns)
     cols = GROUPS[args.features]

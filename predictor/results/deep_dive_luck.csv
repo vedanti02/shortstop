@@ -1,0 +1,10 @@
+source,tasks,luck_brier,outcome_variance,kind,luck_share_of_variance
+"Nebius: Qwen3-Coder, ~10 runs per task",6282,0.05074159693263556,0.24957914650440216,"same agent, repeated runs",0.20330864033842894
+gpt-5.2: default vs high effort,500,0.05399999999999999,0.20247600228691098,two configs (upper bound on luck),0.2666982723388687
+gpt-5.2-high: scaffold v1.17 vs v2.0,500,0.061,0.19801600674056985,two configs (upper bound on luck),0.30805590418717504
+gpt-5-mini: scaffold v1.7 vs v2.0,500,0.08400000000000002,0.24615600289726203,two configs (upper bound on luck),0.3412470100721413
+opus-4.5: scaffold v1.16 vs v2.0,500,0.04999999999999999,0.17817599642181392,two configs (upper bound on luck),0.28062141368150384
+sonnet-4.5: scaffold v1.13 vs v2.0,500,0.064,0.20420400571441633,two configs (upper bound on luck),0.3134120693474807
+deepseek-3.2: scaffold v1.17 vs v2.0,500,0.09999999999999998,0.21000000476837144,two configs (upper bound on luck),0.47619046537784265
+glm: 4.6 vs 5,500,0.135,0.19801600674056985,two configs (upper bound on luck),0.6817630666437482
+devstral: small vs large,500,0.131,0.24855600094223007,two configs (upper bound on luck),0.5270442053436775
