@@ -68,6 +68,89 @@ Three splits for the predictor: `loao` trains on every other agent, `temporal` t
 on agents submitted earlier (31 agents have at least 5 earlier ones), and `lofo` leaves out
 every agent from the same vendor as the one being scored.
 
+## Formulas
+
+Proofs and assumptions are in [THEORY.md](THEORY.md). This is the short version, with the
+function that implements each one.
+
+**Notation.** One run has steps $k = 1, \dots, T$ and outcome $Y \in \{0, 1\}$. The
+predictor outputs $f_k$ after step $k$, with $f_T = Y$. Step $k$ costs $c_k$ tokens.
+$P_k$ is the probability that the run reaches step $k$; it is non-increasing in $k$, at
+least $p_{\min}$, and computed only from what was seen before step $k$.
+
+**Stop step** (`stopping.sample_stop_steps`). One uniform draw $U$ per run:
+
+$$s = \max\{k : U < P_k\}$$
+
+**Estimate for one run** (`stopping.estimate_table`):
+
+$$\hat Y = f_0 + \sum_{k=1}^{s} \frac{f_k - f_{k-1}}{P_k}, \qquad E[\hat Y \mid \text{run}] = Y$$
+
+**Variance and expected cost of one run** (`stopping.exact_moments`), with $e_k = Y - f_k$:
+
+$$\operatorname{Var}(\hat Y \mid \text{run}) = \sum_{k=1}^{T} \frac{e_{k-1}^2 - e_k^2}{P_k} - e_0^2
+= \sum_{k=1}^{T} \Big(\frac{1}{P_k} - \frac{1}{P_{k-1}}\Big) e_{k-1}^2,
+\qquad E[\text{cost} \mid \text{run}] = \sum_{k=1}^{T} c_k P_k$$
+
+**Score and interval for an agent** (`experiments.interval_stats`), over $n$ tasks:
+
+$$\hat\theta = \frac{1}{n} \sum_{i=1}^{n} \hat Y_i, \qquad
+\hat\theta \pm 1.96 \, \frac{\hat\sigma}{\sqrt n}, \qquad
+\hat\sigma^2 = \frac{1}{n-1} \sum_{i=1}^{n} (\hat Y_i - \hat\theta)^2$$
+
+**Compute for a fixed interval width, relative to full runs**
+(`optimal_policy.relative_compute`). This is the number reported as "compute" in the
+tables below; under 100% means cheaper than finishing every run.
+
+$$\text{relative compute} =
+\frac{\big(\operatorname{Var}(Y) + E[\operatorname{Var}(\hat Y \mid \text{run})]\big) \cdot E\big[\sum_k c_k P_k\big]}
+{\operatorname{Var}(Y) \cdot E\big[\sum_k c_k\big]}$$
+
+**Deterministic stopping, the baseline** (`stopping.deterministic_stop`). Stop at the
+first $k$ with $f_k \le lo$ or $f_k \ge hi$ and score the run as $\mathbf 1\{f_k \ge hi\}$.
+Its score is not unbiased, which is why its intervals fail.
+
+**Stopping policies.** Every one below is followed by a running minimum,
+$P_k = \min(P_{k-1}, \text{target}_k)$ with $P_0 = 1$, and the target is clipped to
+$[p_{\min}, 1]$.
+
+| Policy | Target for $P_k$ | Code |
+| --- | --- | --- |
+| Full runs | $1$ | `stopping.reach_full` |
+| One-shot | $q$ | `stopping.reach_one_shot` |
+| Randomized threshold | $q$ once some $f_j \notin (lo, hi)$, else $1$ | `stopping.reach_threshold` |
+| Tracking | $\kappa \sqrt{f_{k-1}(1 - f_{k-1})}$ | `stopping.reach_tracking` |
+| Step schedule | a value per step bin, minimizing $(V_0 + \sum_k a_k / P_k)(\sum_k c_k P_k)$ | `optimal_policy.fit_schedule` |
+| Learned tracking | $\kappa \sqrt{E[e_{k-1}^2 \mid s] \, / \, E[\sum_{j \ge k} c_j \mid s]}$ | `optimal_policy.reach_learned` |
+| Index (derived optimum) | $\kappa \sqrt{\nu_k(s)}$ | `optimal_policy.reach_index` |
+
+Here $s$ is the state (step bin and prediction decile), expectations are measured on the
+training agents, and $\kappa$ is tuned on them.
+
+**The index** (`optimal_policy.fit_index_table`). The best ratio of error removed to cost
+paid, over every rule $\tau$ for how far to look ahead:
+
+$$\nu_k(s) = \max_{\tau \ge k}
+\frac{E\big[e_{k-1}^2 - e_\tau^2 \mid s\big]}{E\big[\sum_{j=k}^{\tau} c_j \mid s\big]}$$
+
+It is computed by backward induction. For a price $\mu$ per token,
+
+$$M_k(s; \mu) = a_k(s) - \mu \, \bar c_k(s) + E\big[\max(M_{k+1}(s'; \mu), 0) \mid s\big], \qquad M_{T+1} = 0,$$
+
+with $a_k(s) = E[e_{k-1}^2 - e_k^2 \mid s]$ and $\bar c_k(s) = E[c_k \mid s]$, and
+$\nu_k(s)$ is the price at which $M_k(s; \mu) = 0$. Learned tracking is the choice
+$\tau = T$.
+
+**Correcting the predictor during an evaluation** (`adaptive.solve_delta`). After each
+batch, with $S$ the tasks seen so far, $m$ the prior weight (`--prior`) and
+$\sigma(x) = 1 / (1 + e^{-x})$, find the shift $\delta$ that solves
+
+$$\frac{1}{|S|} \sum_{i \in S} \sigma\big(\operatorname{logit} f_{i,0} + \delta\big)
+= \frac{\sum_{i \in S} \hat Y_i + m \cdot \frac{1}{|S|} \sum_{i \in S} f_{i,0}}{|S| + m}$$
+
+and use $\sigma(\operatorname{logit} f_{i,k} + \delta)$ as the prediction for the next
+batch.
+
 ## Results so far
 
 Stand-in predictor, leave-one-agent-out, 37 agents. Full tables are in `results/`.
