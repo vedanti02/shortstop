@@ -1,6 +1,6 @@
 """Richer step features for the predictor, one row per step prefix.
 
-    python predictor/features.py                 # SWE-bench Verified runs from coverage/
+    python predictor/step_features.py                 # SWE-bench Verified runs from coverage/
 
 Same layout as coverage/features.py: a run of T steps gives rows k = 0..T-1, row k
 describes what is known after k steps and carries the cost of step k + 1. On top of
@@ -110,40 +110,49 @@ def gold_info(meta: pd.DataFrame) -> dict:
     return info
 
 
-def run_rows(steps: list[dict], g: dict | None) -> list[dict]:
-    gold = g["gold"] if g else []
-    tests = g["tests"] if g else []
-    f2p = g["f2p"] if g else []
-    static = {k: (g[k] if g else np.nan) for k in STATIC}
+class RunFeatures:
+    """Features of one run, updated one step at a time (constant work per step).
 
-    c = dict.fromkeys(["test_runs", "edits", "errors", "nonzero_exits", "tests_passed",
-                       "format_errors", "timeouts", "repro_created", "repro_runs", "repeats",
-                       "git_diffs", "f2p_file_runs", "f2p_name_mentions"], 0)
-    last = {"last_nonzero_exit": 0, "last_test_status": 0, "n_passed_last": 0, "n_failed_last": 0,
-            "consecutive_repeat": 0, "f2p_last_status": 0, "obs_chars_last": 0, "context_tokens": 0}
-    since_test, since_edit, edits_since_test = -1, -1, 0
-    tokens, out_tokens = 0, 0
-    seen_cmds: set[str] = set()
-    prev_cmd = None
-    viewed, found, edited, edited_nongold = set(), set(), set(), set()
-    diff_files: set[str] = set()
+    row() describes what is known after the steps seen so far; update(step) adds the next step.
+    run_rows() is built on it, so offline features and a live harness's features are identical.
+    """
 
-    rows = []
-    for k, step in enumerate(steps):
+    def __init__(self, g: dict | None):
+        self.gold = g["gold"] if g else []
+        self.tests = g["tests"] if g else []
+        self.f2p = g["f2p"] if g else []
+        self.static = {k: (g[k] if g else np.nan) for k in STATIC}
+        self.c = dict.fromkeys(["test_runs", "edits", "errors", "nonzero_exits", "tests_passed",
+                                "format_errors", "timeouts", "repro_created", "repro_runs", "repeats",
+                                "git_diffs", "f2p_file_runs", "f2p_name_mentions"], 0)
+        self.last = {"last_nonzero_exit": 0, "last_test_status": 0, "n_passed_last": 0,
+                     "n_failed_last": 0, "consecutive_repeat": 0, "f2p_last_status": 0,
+                     "obs_chars_last": 0, "context_tokens": 0}
+        self.since_test, self.since_edit, self.edits_since_test = -1, -1, 0
+        self.tokens, self.out_tokens, self.k = 0, 0, 0
+        self.seen_cmds: set[str] = set()
+        self.prev_cmd = None
+        self.viewed, self.found, self.edited, self.edited_nongold = set(), set(), set(), set()
+        self.diff_files: set[str] = set()
+
+    def row(self) -> dict:
+        gold, k = self.gold, self.k
         n_gold = max(len(gold), 1)
-        rows.append({
-            "task_id": step["task_id"], "agent": step["agent"], "k": k,
-            "tokens_so_far": tokens, "mean_out_tokens": out_tokens / k if k else 0.0,
-            **c, **last,
-            "steps_since_test": since_test, "steps_since_edit": since_edit,
-            "edits_since_test": edits_since_test, "edited_files_n": len(edited) + len(edited_nongold),
-            "gold_viewed_frac": len(viewed) / n_gold, "gold_found_frac": len(found) / n_gold,
-            "gold_edited_frac": len(edited) / n_gold, "nongold_edited_n": len(edited_nongold),
-            "diff_gold_frac": len(diff_files & set(gold)) / n_gold,
-            "diff_nongold_n": len(diff_files - set(gold) - set(tests)),
-            **static, "next_cost": step["tokens_in"] + step["tokens_out"], "outcome": step["outcome"],
-        })
+        return {
+            "k": k, "tokens_so_far": self.tokens, "mean_out_tokens": self.out_tokens / k if k else 0.0,
+            **self.c, **self.last,
+            "steps_since_test": self.since_test, "steps_since_edit": self.since_edit,
+            "edits_since_test": self.edits_since_test,
+            "edited_files_n": len(self.edited) + len(self.edited_nongold),
+            "gold_viewed_frac": len(self.viewed) / n_gold, "gold_found_frac": len(self.found) / n_gold,
+            "gold_edited_frac": len(self.edited) / n_gold, "nongold_edited_n": len(self.edited_nongold),
+            "diff_gold_frac": len(self.diff_files & set(gold)) / n_gold,
+            "diff_nongold_n": len(self.diff_files - set(gold) - set(self.tests)),
+            **self.static,
+        }
 
+    def update(self, step: dict) -> None:
+        c, last, gold = self.c, self.last, self.gold
         action, obs = step["action"], step["observation"]
         cmd = command(action)
         m = RETURNCODE.search(obs)
@@ -166,53 +175,63 @@ def run_rows(steps: list[dict], g: dict | None) -> list[dict]:
         c["repro_created"] += bool(REPRO_CREATE.search(cmd))
         c["repro_runs"] += bool(REPRO_RUN.search(cmd))
         key = " ".join(cmd.split())
-        repeat = bool(key) and key in seen_cmds
-        c["repeats"] += repeat
-        last["consecutive_repeat"] = int(bool(key) and key == prev_cmd)
-        seen_cmds.add(key)
-        prev_cmd = key
+        c["repeats"] += bool(key) and key in self.seen_cmds
+        last["consecutive_repeat"] = int(bool(key) and key == self.prev_cmd)
+        self.seen_cmds.add(key)
+        self.prev_cmd = key
         last["obs_chars_last"] = len(obs)
         last["context_tokens"] = step["tokens_in"]
         if "git diff" in cmd:
             c["git_diffs"] += 1
             files = {norm_path(f) for f in DIFF_FILE.findall(obs)}
             if files:
-                diff_files = files
+                self.diff_files = files
         if is_test:
             status, n_pass, n_fail = test_status(cmd, obs, code)
             last.update(last_test_status=status, n_passed_last=n_pass, n_failed_last=n_fail)
-            since_test, edits_since_test = 0, 0
-        elif since_test >= 0:
-            since_test += 1
+            self.since_test, self.edits_since_test = 0, 0
+        elif self.since_test >= 0:
+            self.since_test += 1
         if is_edit:
-            since_edit = 0
-            edits_since_test += 1
-        elif since_edit >= 0:
-            since_edit += 1
+            self.since_edit = 0
+            self.edits_since_test += 1
+        elif self.since_edit >= 0:
+            self.since_edit += 1
 
         # gold
         paths = {norm_path(p) for p in PY_PATH.findall(cmd)}
         for f in gold:
             if f in cmd or f in paths:
-                viewed.add(f)
+                self.viewed.add(f)
                 if is_edit:
-                    edited.add(f)
+                    self.edited.add(f)
             if f in obs:
-                found.add(f)
+                self.found.add(f)
         if is_edit:
             for p in paths:
                 base = p.rsplit("/", 1)[-1]
                 if (p not in gold and not re.match(REPRO_NAME, base) and "test" not in base
                         and not any(p.endswith(f) or f.endswith(p) for f in gold)):
-                    edited_nongold.add(p)
-        if any(t in cmd for t in tests):
+                    self.edited_nongold.add(p)
+        if any(t in cmd for t in self.tests):
             c["f2p_file_runs"] += is_test
             if is_test:
                 last["f2p_last_status"] = test_status(cmd, obs, code)[0]
-        c["f2p_name_mentions"] += any(n in cmd for n in f2p)
+        c["f2p_name_mentions"] += any(n in cmd for n in self.f2p)
 
-        tokens += step["tokens_in"] + step["tokens_out"]
-        out_tokens += step["tokens_out"]
+        self.tokens += step["tokens_in"] + step["tokens_out"]
+        self.out_tokens += step["tokens_out"]
+        self.k += 1
+
+
+def run_rows(steps: list[dict], g: dict | None) -> list[dict]:
+    """One row per step prefix: row k describes what is known after k steps, plus step k+1's cost."""
+    state = RunFeatures(g)
+    rows = []
+    for step in steps:
+        rows.append({"task_id": step["task_id"], "agent": step["agent"], **state.row(),
+                     "next_cost": step["tokens_in"] + step["tokens_out"], "outcome": step["outcome"]})
+        state.update(step)
     return rows
 
 

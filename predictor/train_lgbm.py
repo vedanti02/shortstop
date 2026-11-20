@@ -5,7 +5,8 @@
     python predictor/train_lgbm.py --features gold            # + reference-solution checks
     python predictor/train_lgbm.py --features gold --split insample   # optimistic bound
 
-Splits: loao trains on every other agent, lofo leaves out the agent's whole vendor,
+Splits: loao trains on every other agent, lofo leaves out the agent's whole vendor, temporal
+trains only on agents submitted earlier (agents with fewer than 5 earlier ones are skipped),
 insample trains on all agents including the scored one (only to measure how much is lost
 to never having seen the agent). Like the stand-in, task_rate is how often the training
 agents solved the task. For training rows it is cross-fitted (measured on the other half of
@@ -46,6 +47,7 @@ PARAMS = {"objective": "binary", "learning_rate": 0.05, "num_leaves": 63,
           "bagging_freq": 1, "lambda_l2": 1.0, "verbose": -1, "num_threads": 12}
 MAX_ROUNDS = 2000
 N_VALID_AGENTS = 4
+MIN_TEMPORAL_AGENTS = 5  # as in coverage/standin_predictor.py
 
 
 def task_of(rows: pd.DataFrame) -> pd.Series:
@@ -144,8 +146,8 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("data/swebench_verified"))
     parser.add_argument("--out", type=Path, default=Path("data/predictor"))
     parser.add_argument("--features", choices=list(GROUPS), default="gold")
-    parser.add_argument("--split", choices=["loao", "lofo", "insample", "agentseen", "agentseen_id"],
-                        default="loao")
+    parser.add_argument("--split", choices=["loao", "lofo", "temporal", "insample", "agentseen",
+                                            "agentseen_id"], default="loao")
     parser.add_argument("--weights", type=Path, help="pickled Series of row weights")
     parser.add_argument("--tag", default="")
     parser.add_argument("--seed", type=int, default=0)
@@ -167,6 +169,11 @@ def main() -> None:
             train_agents = [a for a in agents if a != agent]
         elif args.split == "lofo":
             train_agents = [a for a in agents if vendor(a) != vendor(agent)]
+        elif args.split == "temporal":  # only agents submitted earlier (names start with the date)
+            train_agents = [a for a in agents if a[:8] < agent[:8]]
+            if len(train_agents) < MIN_TEMPORAL_AGENTS:
+                print(f"skip {agent}: only {len(train_agents)} earlier agents")
+                continue
         else:
             train_agents = agents
         part = features.loc[features["agent"] == agent, ["agent", "task_id", "k", "next_cost", "outcome"]].copy()

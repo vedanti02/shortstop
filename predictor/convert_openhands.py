@@ -19,7 +19,7 @@ Neither dataset logs token usage, so tokens are estimated as characters / 4, the
 fallback coverage/download_swebench.py uses for older submissions. Observations are cut to
 their first and last 3,000 characters to keep the files small.
 
-A task can have several runs, so task_id is "<instance_id>@<run>"; features.py strips the
+A task can have several runs, so task_id is "<instance_id>@<run>"; step_features.py strips the
 suffix to look up the gold patch. Tasks from the 12 SWE-bench Verified repositories are
 dropped, so these runs can be used to train a predictor that is tested on Verified (Nebius
 by exact repository name, none dropped; CoderForge by verified_repo_pattern, which also

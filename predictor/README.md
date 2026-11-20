@@ -16,11 +16,11 @@ the downloads.
 
 ```bash
 python coverage/download_swebench.py          # Vedanti's download, about 15 minutes
-python predictor/features.py                  # about 1 minute with 8 workers
+python predictor/step_features.py                  # about 1 minute with 8 workers
 python predictor/train_lgbm.py --features gold --split loao     # about 11 minutes
 python predictor/evaluate.py data/predictor/predictions_gold_loao.pkl --name lgbm_gold_loao
 python predictor/convert_openhands.py nebius  # about 8 minutes, 1.6 GB written
-python predictor/features.py --data data/openhands \
+python predictor/step_features.py --data data/openhands \
     --meta data/meta/swebench_verified.parquet data/meta/swerebench_gold.parquet \
     --out data/openhands/features_rich.pkl --workers 1      # about 10 minutes
 ```
@@ -30,7 +30,7 @@ python predictor/features.py --data data/openhands \
 
 | File | What it does |
 | --- | --- |
-| `features.py` | One row per step prefix: Vedanti's counts (identical values), plus *process* features (last test result, steps since the last edit, reproduction scripts, repeated commands, format errors) and *gold* features (has the agent viewed or edited the files the reference patch touches, has it run the tests that must pass) |
+| `step_features.py` | One row per step prefix: Vedanti's counts (identical values), plus *process* features (last test result, steps since the last edit, reproduction scripts, repeated commands, format errors) and *gold* features (has the agent viewed or edited the files the reference patch touches, has it run the tests that must pass) |
 | `train_lgbm.py` | LightGBM, one model per held-out agent; feature groups `base` / `process` / `gold`, splits `loao` / `lofo` / `insample` |
 | `evaluate.py` | Scores any predictions file with Vedanti's five stopping policies, each tuned on the other agents, plus how much the prediction improves through the run |
 | `variance_weights.py` | Row weights that make the training loss equal to the estimator's variance (THEORY.md, Lemma 2) |
@@ -49,6 +49,9 @@ python predictor/features.py --data data/openhands \
 | `cost_aware.py` | Learned remaining cost and error per held-out agent, fed to the stopping policy |
 | `cost_models.py` | Which loss for the remaining-cost model (log squared error, Tweedie, gamma, smearing) |
 | `balanced.py` | Balanced (stratified) stopping uniforms and a design-based interval, with either policy |
+| `export.py` | Predictions for coverage/ (`coverage`) and deployable models for a live harness (`runtime`) |
+| `runtime.py` | Run-time interface: predictions, cost-aware stopping, balanced plan, estimate and interval |
+| `demo_runtime.py` | Replays a held-out agent's logged runs through `runtime.py` as a live harness would |
 
 ## The metric, and a formula that explains most of it
 
@@ -91,7 +94,7 @@ reported as "no difference".
 
 `evaluate.py` on Vedanti's stand-in predictions gives the same median, geometric mean and
 worst case as `coverage/results/policy_loao.csv` for all five policies (largest per-agent
-difference 0.001, identical tuned settings). The base features from `features.py` match
+difference 0.001, identical tuned settings). The base features from `step_features.py` match
 `coverage/features.py` on all 786,050 rows.
 
 ### Check 5: what the external datasets contain (passed, with caveats)
@@ -110,7 +113,7 @@ difference 0.001, identical tuned settings). The base features from `features.py
   held-out evaluation uses Vedanti's 37 agents; the OpenHands data is for extra training and
   a transfer test.
 - 4,044 tasks appear in both datasets, so any split must keep a task on one side.
-- **Both are converted and featurized** (`convert_openhands.py`, then `features.py`):
+- **Both are converted and featurized** (`convert_openhands.py`, then `step_features.py`):
 
   | | Runs | Steps | Resolved | Dropped |
   | --- | --- | --- | --- | --- |
@@ -534,6 +537,75 @@ estimate is off by 0.06 to 0.13, which is why online it ties the plain correctio
   should almost never be wrong; how early it settles can only be measured on live runs, which
   needs a probe hook in Rishi's plug-in.
 - **A reference arm in A/B tests** (`paired_check.py`): 16% less compute for close pairs.
+
+## Using the predictor (integration, Nov 20)
+
+### For coverage/ (Vedanti's plots)
+
+The held-out gold LightGBM predictions in Vedanti's format (agent, task_id, k, f, next_cost,
+outcome):
+
+```bash
+python predictor/train_lgbm.py --features gold --split loao        # or --split temporal
+python predictor/export.py coverage --split loao                   # -> data/predictor/for_coverage/
+python coverage/experiments.py --data data/predictor/for_coverage --split loao
+```
+
+Her scripts write to `coverage/results/`, so the last command overwrites the stand-in's results
+there. The same predictions scored with her policies are already in
+`results/lgbm_gold_{loao,temporal}_policy.csv` (`evaluate.py`). The temporal split covers the
+same 31 agents as hers; tracking needs a median of 56.7% of full-run compute there, against
+63% for the stand-in.
+
+### For a live harness (Rishi's plug-in)
+
+`runtime.py` runs everything at evaluation time: the success prediction, the learned remaining
+cost, the cost-aware stopping policy, the balanced plan, and the estimate with its design-based
+interval.
+
+```bash
+python predictor/export.py runtime     # trains on all 37 agents -> data/predictor/runtime/all/
+```
+
+```python
+from runtime import Runtime
+rt = Runtime.load("data/predictor/runtime/all")
+plan = rt.plan(task_ids, seed=0)              # all tasks of a batch, before any run starts
+for task_id in task_ids:
+    run = plan.start(task_id)
+    while run.should_continue():              # decided before every agent step
+        step = ...                            # one agent step: a shortstop.Step or a dict of its fields
+        run.observe(step)
+        if submitted:
+            run.finish(outcome)               # 0 or 1, from the benchmark's tests
+            break
+print(plan.result())   # score, 95% interval, tokens, runs started and finished
+```
+
+- **Step format.** Steps are in the shared format: actions with the command in a ```bash block,
+  as mini-swe-agent writes them, and observations with `<returncode>`.
+- **Task features.** These exist for SWE-bench Verified tasks. Other tasks fall back to average
+  difficulty: the estimate stays unbiased but costs more.
+- **Batch planning.** The balanced plan needs every task of a batch planned before the first run
+  starts. `rt.predictor(task_id)` gives the plain `shortstop.Predictor` interface.
+- **Two probability conventions.** `shortstop.rr_estimate` takes conditional continue
+  probabilities, p_k = P(continue into step k | reached step k - 1). `coverage/stopping.py` and
+  `runtime.py` work with P_k = P(reach step k). `runtime.py` converts before calling
+  `rr_estimate`. Passing P_k directly double-counts and biases the estimate badly;
+  `tests/test_runtime.py` caught this.
+- **Tests.** `tests/test_runtime.py` checks that the step features match the offline ones, that
+  the policy never increases and respects the floor, that the estimate matches the formula, and
+  that the live loop is unbiased.
+- **Name clash.** `step_features.py` was renamed from `features.py`, which clashed with
+  `coverage/features.py` on the import path.
+
+**End to end on real runs of agents the models never saw** (`demo_runtime.py`, models from
+`export.py runtime --exclude <agent>`, 20 complete evaluations each):
+
+| Held-out agent | True rate | Mean score (sd) | Interval contains truth | Half-width (full runs) | Tokens spent | Compute for the reported width |
+| --- | --- | --- | --- | --- | --- | --- |
+| claude-4.5-sonnet-high | 0.714 | 0.717 (0.035) | 19 / 20 | 0.077 (0.040) | 7.5% | 28% |
+| gpt-oss-120b | 0.260 | 0.266 (0.045) | 20 / 20 | 0.110 (0.038) | 9.6% | 79% |
 
 ## A trained component that beats the hand-made policies: learned remaining cost (Nov 20)
 

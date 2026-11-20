@@ -9,7 +9,7 @@ same tasks, repeated runs, and reasoning-effort pairs.
 
 One step is one action: a tool call (with the assistant text before it) and its result, a
 Codex file change, a Junie agent step, or the final message. Every action is rewritten as the
-shell command with the same effect, so predictor/features.py works unchanged:
+shell command with the same effect, so predictor/step_features.py works unchanged:
 
     bash / bash_terminal / shell {command}   -> the command
     Read / read {file_path | path}           -> cat <path>
