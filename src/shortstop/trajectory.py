@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -21,9 +22,10 @@ class Step:
 
 
 def load_trajectories(path: str | Path) -> dict[tuple[str, str], list[Step]]:
-    """Read a JSONL file into {(task_id, agent): [steps in order]}."""
+    """Read a JSONL file (optionally .gz) into {(task_id, agent): [steps in order]}."""
     runs: dict[tuple[str, str], list[Step]] = defaultdict(list)
-    with open(path) as f:
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as f:
         for line in f:
             if line.strip():
                 step = Step(**json.loads(line))
