@@ -125,7 +125,8 @@ $[p_{\min}, 1]$.
 | Index (derived optimum) | $\kappa \sqrt{\nu_k(s)}$ | `optimal_policy.reach_index` |
 
 Here $s$ is the state (step bin and prediction decile), expectations are measured on the
-training agents, and $\kappa$ is tuned on them.
+training agents, and $\kappa$ is tuned on them. In the step schedule,
+$V_0 = \operatorname{Var}(Y) - E[e_0^2]$ and $a_k = E[e_{k-1}^2 - e_k^2]$.
 
 **The index** (`optimal_policy.fit_index_table`). The best ratio of error removed to cost
 paid, over every rule $\tau$ for how far to look ahead:
