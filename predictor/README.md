@@ -35,6 +35,20 @@ python predictor/features.py --data data/openhands \
 | `evaluate.py` | Scores any predictions file with Vedanti's five stopping policies, each tuned on the other agents, plus how much the prediction improves through the run |
 | `variance_weights.py` | Row weights that make the training loss equal to the estimator's variance (THEORY.md, Lemma 2) |
 | `convert_openhands.py` | Nebius / CoderForge OpenHands runs into the shared step format |
+| `compare.py` | Paired comparison of predictors over the same held-out agents |
+| `oracle_shift.py` | Bound: each agent's predictions shifted to average its true rate |
+| `adaptive_eval.py` | Vedanti's in-evaluation correction (`coverage/adaptive.py`, unchanged) run on any predictions |
+| `train_ability.py` | Ability-aware predictor: the agent's resolve rate is an input, on top of a uniform logit shift |
+| `ability_eval.py` | Simulated evaluations with the ability-aware predictor, the rate estimated from earlier batches |
+| `paired_check.py` | Premise check for tool A/B tests: a fully run reference arm as a predictor input |
+| `deep_dive.py` | Why the learned predictor did not beat LightGBM: cost decomposition, luck, timing, sensitivity |
+| `probe_estimate.py` | Offline estimate of mid-run test probes (hidden tests run after the decisive edit) |
+| `convert_rebench_lb.py` | SWE-rebench leaderboard trajectories (36 configurations, 5 runs per task) into the shared format |
+| `paired_rebench.py` | A/B reference-arm check on the leaderboard's real one-change pairs |
+| `allocation_check.py` | Premise check: what per-task, cost-aware allocation is worth (one-shot policies) |
+| `cost_aware.py` | Learned remaining cost and error per held-out agent, fed to the stopping policy |
+| `cost_models.py` | Which loss for the remaining-cost model (log squared error, Tweedie, gamma, smearing) |
+| `balanced.py` | Balanced (stratified) stopping uniforms and a design-based interval, with either policy |
 
 ## The metric, and a formula that explains most of it
 
@@ -96,8 +110,38 @@ difference 0.001, identical tuned settings). The base features from `features.py
   held-out evaluation uses Vedanti's 37 agents; the OpenHands data is for extra training and
   a transfer test.
 - 4,044 tasks appear in both datasets, so any split must keep a task on one side.
-- Nebius is converted (4.3M steps) and featurized; gold patches for SWE-rebench tasks come
-  from `nebius/SWE-rebench` (21,336 tasks).
+- **Both are converted and featurized** (`convert_openhands.py`, then `features.py`):
+
+  | | Runs | Steps | Resolved | Dropped |
+  | --- | --- | --- | --- | --- |
+  | Nebius | 67,074 | 4.3M | 48% | none (exact Verified-repository filter; 137 tasks from related repositories such as Django plugins should be excluded when training for Verified) |
+  | CoderForge (3 splits) | 249,462 | 14.2M | 60.5% | 900 errored, 7,772 from Verified or related repositories (11 shards entirely) |
+
+  Gold patches come from `nebius/SWE-rebench` (21,336 tasks) and `SWE-bench/SWE-smith`
+  (59,136 tasks); the R2E-Gym tasks have none, so their gold features are missing.
+- Several runs per task make both useful for measuring luck (see the deep dive): run-to-run
+  randomness of one agent on one task accounts for 15 to 33% of the variation in outcomes,
+  depending on the task source.
+
+### Other datasets (survey, Nov 20)
+
+What the project lacks most is many agents on the same tasks (held-out-agent tests), repeated
+runs (luck), and pairs that differ by one change (A/B). All of these include failing runs;
+existence, size, row counts and licence were checked against the Hugging Face API.
+
+| Dataset | Runs / tasks | Agents | Repeats / A-B | Tokens | Licence, size | Best use |
+| --- | --- | --- | --- | --- | --- | --- |
+| `nebius/SWE-rebench-leaderboard-trajectories` | 27,348 / 221 | 30 models, 52 configs (common scaffold plus Claude Code, Codex, Cursor) | 5 runs per task; reasoning-effort panels | per run, with cost | CC-BY-4.0, 0.67 GB, one schema | Held-out agents on a second, fresh benchmark; luck; A/B |
+| `JetBrains-Research/SWE-TaskFlow-SWE-Bench-Pro-Trajectories` | 25,200 / 700 | 4 models, mini-swe-agent | 3 prompt conditions × 3 runs | per call | "other" (terms to check), 6.3 GB | A/B with real prompt changes, the closest proxy for tool changes |
+| `nvidia/Open-SWE-Traces` | 1.14M | 6 open models × 5 scaffolds | ~2 runs per task in some configs; 3 reasoning efforts | none | CC-BY-4.0, 98 GB | Training volume; scaffold A/B pairs (stream, do not store) |
+| `harborframework/terminal-bench-2-leaderboard` | ~75 agents × 89 tasks × ≥5 trials | ~75 agent+model combos | ≥5 trials per task | per step for some agents | Apache-2.0, ≥4.4 GB, >100K files | Held-out agents and luck outside coding; formats vary by agent |
+| SWE-bench Verified, non-mini submissions (`swe-bench-submissions` bucket, `verified/`) | ~120 systems × 500 | ~120 scaffold+model systems | 1 run | varies | none stated | More held-out agents on our 500 tasks; free-form formats |
+
+Smaller or weaker fits: `nebius/Longtail-SWE-trajectories` (6,666 runs, 11 models, 3 runs
+each), `melissapan/swe-bench-lite-agent-traces-v14` (1,890 runs, 7 models × 3 CLI agents),
+tau2-bench submissions, Toolathlon, HAL traces (encrypted), Multi-SWE-bench,
+`nebius/SWE-agent-trajectories` (Llama only). EarlyEval and "Doomed from the Start" have not
+released data; SWE-Dev, R2E-Gym SFT and SWE-Factory trajectories are success-only.
 
 ### A leak found and fixed: leave-one-out task solve rate
 
@@ -272,6 +316,491 @@ LightGBM: the theory says the two aim at the same function, and the data agree. 
 that exists is the agent's strength, learned from its own outcomes during the evaluation,
 which keeps the estimate unbiased by Theorem 2b in `coverage/THEORY.md`.
 
+## Agent-adaptive predictor (Nov 20)
+
+All rows in this section use the simulation of `coverage/adaptive.py`: tasks resampled with
+replacement, batches of 25, the tracking policy with kappa 0.25, 1,500 replicates. Numbers
+are the geometric mean of relative compute over the 37 held-out agents; coverage is mean /
+worst agent. `adaptive_eval.py` reproduces Vedanti's committed results for the stand-in
+(adaptive, floor 0.2, damping 50: median 55.1% against 54.9%).
+
+### Vedanti's correction on LightGBM predictions
+
+| Floor | Damping | Static | + correction | Agent known (bound) | Oracle shift (bound) |
+| --- | --- | --- | --- | --- | --- |
+| 0.05 | 0 | 51.9% (94.6 / 92.7) | 53.4% (92.5 / 88.3) | 45.5% (94.7 / 93.2) | 44.0% (94.1 / 86.9) |
+| 0.1 | 50 | 58.2% (94.6 / 93.2) | 52.6% (93.8 / 92.5) | 50.1% (94.7 / 93.5) | 49.6% (94.6 / 91.7) |
+| 0.2 | 50 | 64.2% (94.8 / 93.0) | 57.9% (94.4 / 92.6) | 57.1% (94.8 / 93.2) | 55.9% (94.7 / 92.9) |
+
+Damping at floor 0.05 (correction only):
+
+| Damping (tasks) | 0 | 50 | 100 | 200 | 400 |
+| --- | --- | --- | --- | --- | --- |
+| Compute | 53.4% | 47.5% | 46.8% | 47.0% | 47.8% |
+| Coverage | 92.5 / 88.3 | 92.9 / 91.3 | 93.3 / 91.2 | 93.7 / 90.9 | 94.1 / 92.2 |
+
+- At floors 0.1 and 0.2 the correction closes 65 to 76% of the gap to the oracle and fixes
+  the worst agent.
+- **The floor itself is expensive**: the oracle at floor 0.2 (55.9%) costs more than no
+  correction at floor 0.05 (51.9%). The prize is a correction that works at floor 0.05.
+- At floor 0.05 the right damping is about 100 tasks (a noise-to-spread ratio: each task's
+  estimate has variance about 1.3, agents' rates vary by about 0.13, and 1.3 / 0.13² ≈ 80),
+  which closes 80% of the gap to the agent-known bound. Coverage drops to 93.3%, and the
+  misses are one-sided: the interval lies entirely above the truth twice as often as below
+  (4.6% against 2.2%), on weak, middle and strong agents alike.
+
+### Why a uniform shift skews the estimate
+
+Exact skewness of a task's estimate at floor 0.05 (no simulation), median over agents:
+static −2.7, oracle uniform shift −4.4 (+11.6 for the weakest agent), agent-known model −2.7,
+although the agent-known model has the most runs at the floor (24% against 11% static).
+Skew comes from confident predictions that turn out wrong. A uniform shift raises every
+task for a strong agent, including the ones it fails, whose rare finished runs then carry a
+weight of up to 20. The agent-known model learned which tasks move with the agent's
+strength.
+
+### Ability-aware predictor (`train_ability.py`)
+
+The agent's resolve rate theta is an input: logit f = [logit theta − logit(mean training
+theta)] + trees(features, theta), with a monotone constraint on theta. The uniform shift is
+the starting point and extrapolates to agents weaker or stronger than any training agent;
+the trees learn where it should be smaller or larger. For training runs theta is the
+agent's rate on the other half of its tasks.
+
+With theta set to the true rate (a bound), it is the cheapest predictor tried:
+
+| | Tracking, tuned | Learned tracking | Index | Floor-0.05 simulation | Median skew |
+| --- | --- | --- | --- | --- | --- |
+| Uniform oracle shift | 44.7% | 44.7% | 46.6% | 44.0% (94.1 / 86.9) | −4.4 |
+| Agent known | 46.0% | 45.6% | 46.2% | 45.5% (94.7 / 93.2) | −2.7 |
+| Ability-aware, true theta | **42.2%** | **43.0%** | **44.2%** | **41.6%** (94.6 / 90.1) | −2.7 |
+
+With theta estimated from earlier batches (`ability_eval.py`), the advantage is gone:
+
+| Floor 0.05 | Compute | Worst agent | Coverage |
+| --- | --- | --- | --- |
+| LightGBM + Vedanti's correction, damping 100 | 46.8% | 1.29x | 93.3 / 91.2 |
+| Ability-aware, damping 100 | 46.4% | 1.33x | 93.0 / 90.8 |
+| Ability-aware, precision-weighted (empirical Bayes) | 47.6% | 1.85x | 92.7 / 90.5 |
+| Ability-aware, first 50 tasks run to the end | 91.6% | 1.77x | 92.9 / 91.0 |
+| Ability-aware, first 100 tasks run to the end | 128.1% | 2.57x | 93.0 / 90.7 |
+| Ability-aware, first 100 tasks at floor 0.3 | 62.9% | 1.40x | 92.8 / 90.9 |
+| Ability-aware, true theta (bound) | 41.6% | 0.75x | 94.6 / 90.1 |
+
+At floor 0.1 (damping 50) it is 52.1% against 52.6% for the correction, at floor 0.2 57.8%
+against 57.9%.
+
+- **Online, the ability-aware predictor ties the uniform correction.** The bottleneck is the
+  estimate of theta, not the predictor: at floor 0.05 a task's estimate has variance about
+  1.3, so after 100 tasks theta is still uncertain by about ±0.11, as large as the spread
+  between agents.
+- **Learning theta first does not pay.** The aggressive evaluation spends only about 7% of
+  full-run tokens, so finishing even 50 tasks (10% of full cost) more than doubles the bill.
+- **The coverage loss comes from estimating theta inside the evaluation**: with theta fixed
+  at the true rate, mean coverage is 94.6%; with theta from earlier batches it is about 93%
+  whichever rule is used, and even after 100 exact tasks. This belongs with the interval
+  theory (`coverage/THEORY.md`, Section 3).
+
+### Where the strength can come from: a reference arm in tool A/B tests (`paired_check.py`)
+
+A cheap evaluation does not contain enough information to learn the agent's strength. In a
+tool A/B test it does not have to: the baseline setup has usually been run to the end
+already, and its outcome on each task is known before the variant is evaluated, so using it
+as an input keeps the variant's estimate unbiased. The 37 agents include pairs that differ
+the way an A/B test would (same model, another mini-swe-agent version or reasoning effort).
+The variant's step-0 prediction combines its held-out LightGBM prediction with the reference
+arm's outcome, through a logistic regression fitted on the other pairs:
+
+| Pairs (both directions) | One-shot compute, LightGBM | With the reference arm |
+| --- | --- | --- |
+| Close: the arms agree on at least 87% of tasks (8) | 47.7% | **40.2%** |
+| Distant: below 87% (8) | 53.5% | 56.2% |
+| All (16) | 50.5% | 47.5% |
+
+Close pairs are the same model under a scaffold or effort change (gpt-5.2, gpt-5.2-high,
+opus-4.5, sonnet-4.5); for them the variant needs 16% less compute. Distant pairs (glm 4.6 →
+5, devstral small → large, gpt-5-mini v1.7 → v2.0, deepseek-3.2 v1.17 → v2.0) get worse,
+because a combination learned on all pairs trusts the reference arm too much for them. Tool changes
+keep the model and the scaffold, so they should sit at the close end; Rishi's runs will
+show it.
+
+## Why the learned predictor did not beat LightGBM (deep dive, Nov 20)
+
+`deep_dive.py` and `probe_estimate.py`; tables in `results/deep_dive_*.csv`. Policy-dependent
+numbers use tracking at kappa 0.25 with a 0.05 floor; compute is the geometric mean over the
+37 held-out agents.
+
+### 1. Most of the cost comes from the step-0 prediction
+
+Lemma 2 splits each task's estimator variance exactly into the outcome's own variance (there
+even with full runs), the term from runs stopped before step 1 and scored by the step-0
+prediction, and the terms from predictions during the run.
+
+| Predictor | Outcome's variance | Step-0 term | In-run terms | Tokens spent | Compute | If step 0 were perfect | If in-run were perfect |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Stand-in | 13.7% | 67.1% | 19.2% | 7.1% | 55.9% | 18.0% | 45.0% |
+| LightGBM gold | 14.8% | 67.6% | 17.6% | 7.2% | 52.7% | 16.5% | 43.3% |
+| Ability-aware, true theta | 17.9% | 73.9% | 8.1% | 7.4% | 42.2% | 10.9% | 38.7% |
+
+(Shares are means over agents; the last two columns keep the policy fixed.) Two thirds of the
+variance comes from the step-0 prediction. A perfect step-0 prediction would cut compute to a
+third; perfect predictions during the run only by a fifth.
+
+### 2. The step-0 prediction is limited by information, not by training
+
+The variance-weighted model put 74% of its training weight on step-0 rows and got the same
+step-0 error; it only lost accuracy later in the run:
+
+| Brier score | Step 0 | Steps 1-4 | 5-19 | 20-49 | 50+ |
+| --- | --- | --- | --- | --- | --- |
+| Plain LightGBM | 0.1267 | 0.1214 | 0.1145 | 0.1143 | 0.1242 |
+| Variance-weighted | 0.1275 | 0.1238 | 0.1209 | 0.1207 | 0.1368 |
+| Share of training weight | 73.5% | 12.3% | 8.8% | 3.8% | 1.7% |
+
+At step 0 the model knows only the task, and 60% of its split gain is one feature, how often
+the other agents solved the task (then repeated commands 7%, gold patch size 5%, everything
+else 2.6% or less). More training effort on the same information cannot help.
+
+### 3. What the step-0 error is made of
+
+| Part of the step-0 Brier score (mean over agents) | Size | Share | How it was measured |
+| --- | --- | --- | --- |
+| Not knowing the agent's strength | 0.029 | 23% | held out (0.127) minus ability-aware with the true rate (0.098) |
+| Which tasks this agent solves, beyond its strength and the task's difficulty | 0.046 | 36% | the rest |
+| Luck: the same agent on the same task passing or failing | 0.052 | 41% | below |
+
+Luck is measured two ways. Where one agent ran each task several times, the run-to-run
+variance is: Nebius 0.051 (about 10 runs per task; 20% of the outcome variance), CoderForge
+SWE-smith tasks 0.037 (4 runs; 15%), SWE-rebench tasks 0.070 (8 runs; 29%), R2E-Gym tasks
+0.076 (8 runs; 33%). On SWE-bench, two near-identical configurations of one model disagree on
+a task with probability d, which bounds the luck by d / 2: 0.054 for gpt-5.2 default against
+high effort, 0.050 for opus-4.5 across a scaffold version (0.06 to 0.13 for less similar
+pairs). No predictor can remove the luck, so even with the agent known a step-0 prediction
+keeps a Brier score of at least about 0.05 on SWE-bench Verified.
+
+**A model-family prior does not help.** Adding how often the new agent's same-vendor siblings
+solved each task changes step-0 Brier from 0.1267 to 0.1280 (better for 18 of 37 agents).
+
+### 4. The deciding information arrives at the end, and the logs do not show it
+
+Share of the step-0 uncertainty (Brier score) resolved after a share of the run's tokens:
+
+| Tokens spent | 10% | 25% | 50% | 75% | 90% | Last step before the outcome |
+| --- | --- | --- | --- | --- | --- | --- |
+| LightGBM gold | 5.4% | 7.8% | 10.1% | 11.2% | 12.0% | 13.0% |
+| LightGBM base | 2.1% | 2.1% | 3.1% | 4.6% | 5.1% | 5.1% |
+
+One step before the end, 87% of the uncertainty is still there: the outcome is decided by the
+hidden tests, which the agent's own checks do not reproduce. Yet the code that decides it
+exists much earlier:
+
+| Share of the run's tokens at... (median, interquartile range) | Runs that pass | Runs that fail |
+| --- | --- | --- |
+| the last edit of any file | 89% (76-95%) | 91% (79-95%) |
+| the last edit to a file the reference patch touches | **27%** (16-42%) | **25%** (13-42%) |
+
+Agents finish changing the files that matter about a quarter of the way through and spend the
+rest testing, writing scratch scripts and polishing.
+
+### 5. The ability-aware predictor needs the agent's strength to within ±0.05
+
+| Error in theta | −0.20 | −0.15 | −0.10 | −0.05 | 0 | +0.05 | +0.10 | +0.15 | +0.20 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Compute | 65.6% | 57.0% | 49.0% | 43.5% | 42.1% | 44.9% | 51.3% | 59.2% | 70.2% |
+
+Typical error of the in-evaluation estimate (damping 100, normal approximation): 0.127 after
+25 tasks, 0.097 after 100, 0.078 after 200, 0.056 at the end. For most of an evaluation the
+estimate is off by 0.06 to 0.13, which is why online it ties the plain correction.
+
+### What this says about improving it
+
+- **More features, other losses, family priors: no.** The step-0 prediction is capped by
+  information, and in-run features see little before the end.
+- **Mid-run test probes: the most promising.** Run the benchmark's hidden tests on the
+  agent's code after it edits, at no LLM-token cost, and feed the result to the predictor.
+  `probe_estimate.py` approximates this offline: from the step after a run's last gold-file
+  edit (detected in 87% of runs), the prediction becomes a signal that matches the final
+  outcome with a given accuracy.
+
+  | Probe | Tracking | Learned tracking | Index | Worst agent (tracking) |
+  | --- | --- | --- | --- | --- |
+  | None | 53.0% | 52.6% | 54.1% | 4.7x |
+  | 75% accurate | 52.6% | 51.6% | 54.0% | 5.0x |
+  | 90% accurate | 50.8% | 55.5% | 53.4% | 4.4x |
+  | Always right | **30.0%** | **35.3%** | **36.0%** | 2.5x |
+
+  The gain hinges on accuracy: a wrong confident signal on a stopped run is very costly. Tests
+  run on the final code are the final grade by definition, so after the last real edit a probe
+  should almost never be wrong; how early it settles can only be measured on live runs, which
+  needs a probe hook in Rishi's plug-in.
+- **A reference arm in A/B tests** (`paired_check.py`): 16% less compute for close pairs.
+
+## A trained component that beats the hand-made policies: learned remaining cost (Nov 20)
+
+The theory note and Check 3 show that training the success predictor on the variance objective
+cannot beat a calibrated classifier. Theorem 1 says what else the optimal policy needs: the
+expected cost still to come. Vedanti's policies either ignore it (tracking) or estimate it on
+a coarse state (learned tracking: step bin and prediction decile), yet run costs vary a lot
+(coefficient of variation 1.3 across one agent's tasks).
+
+**Premise** (`allocation_check.py`, one-shot policies; `cost_aware.py`, per-step): told each
+run's true cost, a policy spends much less.
+
+| Policy (gold LightGBM, held out) | Compute | vs reference |
+| --- | --- | --- |
+| One-shot, same probability for every task | 56.6% | |
+| One-shot, by uncertainty f (1 - f) | 54.2% | 0.958x |
+| One-shot, by uncertainty / cost predicted from the task | 52.5% | 0.928x |
+| One-shot, by uncertainty / true run cost (bound) | 46.2% | 0.817x |
+| Tracking (per step) | 52.6% | |
+| Tracking with the true remaining cost (bound) | 45.1% | 0.857x |
+
+**Learned inputs** (`cost_aware.py`): two LightGBM regressions per held-out agent, trained on
+the other agents, predict from each step's features (plus how expensive the task was for the
+other agents) the log of the tokens still to be spent and the squared error of the current
+prediction. The predicted remaining cost (relative to its mean at step 0 over the agent's runs)
+enters the tracking target as kappa * sqrt(f (1 - f) / r_hat). Correlation of predicted and
+true log remaining cost: median 0.61 over agents (0.38 to 0.78).
+
+| Policy | Median | Geo. mean | vs tracking | Worst agent | Coverage, mean / worst |
+| --- | --- | --- | --- | --- | --- |
+| Tracking | 47.9% | 52.6% | | 4.46x | 94.4% / 91.8% |
+| + learned error | 48.2% | 53.7% | 1.021x | 5.27x | 94.5% / 91.4% |
+| **+ learned remaining cost** | **45.3%** | **48.9%** | **0.931x** | **3.02x** | **95.1% / 93.0%** |
+| + both | 44.7% | 49.2% | 0.936x | 3.30x | 94.8% / 92.8% |
+| + true remaining cost (bound) | 42.6% | 45.1% | 0.857x | 2.88x | 94.5% / 92.4% |
+
+- **The learned remaining cost recovers half of what a perfect cost oracle gives** and beats
+  every hand-made policy (tracking 52.6%, learned tracking 52.6%, index 54.1%, one-shot 56.6%),
+  with coverage intact.
+- **A learned error estimate does not help**, as the theory note predicts: f (1 - f) from a
+  calibrated classifier is already the right uncertainty.
+
+**Robustness.** The gain holds across training seeds and on the second benchmark:
+
+| Run | Tracking | + learned remaining cost | Ratio | Agents cheaper | Coverage, mean / worst | True-cost bound |
+| --- | --- | --- | --- | --- | --- | --- |
+| Verified, seed 0 | 52.6% | 48.9% | 0.931x | 34/37 | 95.1% / 93.0% | 45.1% |
+| Verified, seed 1 | 52.1% | 48.3% | 0.928x | 34/37 | 94.9% / 91.8% | 44.8% |
+| Verified, seed 2 | 53.0% | 49.3% | 0.930x | 34/37 | 94.9% / 92.6% | 45.1% |
+| SWE-rebench leaderboard (36 configurations) | 57.9% | 53.3% | 0.921x | 30/34 * | 94.8% / 93.0% | 50.2% |
+
+\* configurations with a 20 to 80% resolve rate; over all 36 the ratio is 0.921x as well. The
+ratio varies by 0.3 points across seeds, against the 3.4% spread of absolute levels, because a
+seed moves both policies together. On both benchmarks the learned cost model captures 50 to
+60% of what the true remaining cost would give.
+
+**The cost model's loss does not matter** (`cost_models.py`, Verified): squared error on
+log(1 + r) gives 48.9%; Tweedie and gamma losses, which target E[r] directly, 49.1%; Duan's
+smearing correction is a constant factor and cancels in the relative cost (48.9%). The gap to
+the true-cost bound is the part of a run's length that the features cannot predict, not the
+choice of loss.
+
+## Balanced stopping decisions, stacked with the learned cost (Nov 20)
+
+`balanced.py`; tests in `tests/test_balanced.py`.
+
+**Design.** Each run still stops at s = max{k : U < P_k} with a single uniform U. By Lemma 1 the
+estimate stays exactly unbiased as long as each run's U is uniform and independent of that run,
+so the uniforms of different runs may depend on each other. They are spread evenly within
+strata, in four steps:
+
+1. Sort the runs by their step-1 reach probability P_1 (ties by f0).
+2. Cut them into strata of B = 50 runs.
+3. Assign the runs of a stratum U = (position + V) / B, with a random permutation of positions
+   and independent V ~ U(0, 1). This is a Latin hypercube, Vihola's (2018) stratified truncation.
+4. The numbers of runs that start, and that reach each later step, become nearly fixed within a
+   stratum, so its average miscalibration cancels.
+
+The tests check three things: each stratum is a Latin hypercube, every run's U is uniform
+(Kolmogorov-Smirnov), and the estimates average to the true outcomes (20,000 Monte Carlo draws).
+
+**Intervals.** Under this design, sd / sqrt(n) stays valid but conservative, and it does not
+get narrower. The design-based estimator splits the variance of the mean into two parts:
+
+- **The outcome's own variance**, Var(Y) / n. Y is binary, so this is θ̂ (1 − θ̂) / n.
+- **The corrections' design variance.** Only runs that start carry a correction c = Ŷ − f0.
+  Within each stratum, merged with the next until it has at least 2 started runs, it is
+  estimated from the spread of c · (expected number started), with the finite-population
+  correction 1 − m / B, and Student's t with Σ (m − 1) degrees of freedom.
+
+The spread is measured within a stratum, so the stratum's average miscalibration does not count
+toward the variance. Two cheaper variants under-cover slightly or barely help: dropping the
+finite-population correction leaves the intervals as wide as the naive ones, and using the
+normal quantile instead of t gives 94.2% coverage. Paired- or successive-difference estimators
+on stratum totals have too few degrees of freedom and count the planned differences between
+strata as noise.
+
+**Results** (gold LightGBM held out, policies tuned on the other agents, 1,000 replicates). The
+reported column is the compute needed to reach the interval width that is actually reported,
+relative to full runs.
+
+| SWE-bench Verified (37 agents) | Actual | Reported | Coverage, mean / worst | Worst agent (actual) |
+| --- | --- | --- | --- | --- |
+| Tracking, independent stopping, sd / sqrt(n) (the baseline) | 53.3% | 51.3% | 94.4% / 91.9% | 4.79x |
+| Learned remaining cost, independent | 48.9% | 47.7% | 94.8% / 92.5% | 3.18x |
+| Tracking, balanced, design-based interval | 45.3% | 46.5% | 94.7% / 92.1% | 1.43x |
+| **Learned remaining cost, balanced, design-based interval** | **43.3%** | **43.2%** | **94.6% / 92.9%** | **1.11x** |
+
+| SWE-rebench leaderboard (36 configurations) | Actual | Reported | Coverage, mean / worst |
+| --- | --- | --- | --- |
+| Tracking, independent, sd / sqrt(n) | 58.2% | 57.0% | 94.7% / 92.4% |
+| Learned remaining cost, independent | 53.3% | 52.4% | 94.9% / 93.1% |
+| **Learned remaining cost, balanced, design-based interval** | **46.7%** | **48.0%** | **94.8% / 93.5%** |
+
+The two improvements stack. Against the baseline they cut the compute for a given reported
+interval width by 16% on both benchmarks: the per-agent geometric-mean ratio is 0.842 on
+Verified (37 of 37 agents cheaper) and 0.843 on the leaderboard (35 of 36). Coverage matches
+the baseline's.
+
+**Who gains** (Verified, final against baseline, geometric-mean ratio by resolve rate):
+
+| Resolve rate | Up to 30% | 30-50% | 50-65% | Above 65% |
+| --- | --- | --- | --- | --- |
+| Ratio | 0.40 | 0.68 | 0.94 | 0.87 |
+| Agents | 2 | 3 | 14 | 18 |
+
+The worst agent drops from 4.3x to 1.3x full-run compute. On the leaderboard the 0.7%-resolve
+configuration improves from 42.9x to 16.4x but stays far above full runs.
+
+**Caveats.**
+
+- **B = 50 was chosen among {25, 50, 100}.** B = 25 is within a point, so the choice matters
+  little.
+- **The design needs f0 and P_1 for a batch of runs before deciding which to start.** Both use
+  only task features and the learned step-0 cost, so this works in a live evaluation.
+- **θ̂ (1 − θ̂) / n targets the population of tasks** (Theorem 2a's setting). For a fixed task
+  set the interval is conservative.
+
+## Literature survey: Monte Carlo methods and novelty (Nov 20)
+
+Citations were checked against arXiv, DOI records or publisher pages.
+
+**Already optimal.** The sqrt(error removed / cost) allocation behind tracking, learned
+tracking and the index policy is the state-dependent form of the optimal randomization
+distribution for randomized truncation estimators (Rhee and Glynn 2015, Props. 1 to 3, with
+the variance x compute efficiency criterion of Glynn and Whitt 1992). It also matches Neyman
+allocation, multilevel Monte Carlo allocation (Giles 2008), and active statistical inference
+with costs (Zrnic and Candès 2024, arXiv 2403.03208). The coupled-sum estimator used here is
+the right one for a single run: the single-term estimator pays for the same prefix but uses
+only the last increment, and the independent-sum estimator needs increments generated
+separately. `coverage/THEORY.md` should cite Rhee and Glynn for the non-adaptive version of
+Theorem 1.
+
+**Novelty.** No prior work applies randomized truncation to AI-agent or LLM evaluation.
+
+- **Closest problem: EarlyEval** (arXiv 2609.02783). It uses LightGBM, leave-one-agent-out
+  and SWE-bench Verified, but stops at fixed thresholds and substitutes the prediction for the
+  outcome: 1 to 2 points of bias, no intervals, no cost model.
+- **An independent audit** (arXiv 2609.25647) finds that such predictors' calibration does not
+  transfer to new agents, which matches the deep dive.
+- **Closest mechanism:** efficiency-aware Russian roulette and splitting in rendering (EARS,
+  Rath et al. 2022), which sets survival probabilities from variance and cost estimates, and
+  Beatson and Adams (ICML 2019), who tune a truncation distribution online per unit of compute.
+- **The estimator is classical:** augmented inverse-probability weighting with known
+  missingness probabilities and surrogate markers (Robins and Rotnitzky 1992), and two-phase
+  sampling (Särndal and Swensson 1987).
+- **What is new here:** per-run stopping inside agent trajectories driven by a learned
+  remaining-cost model, exact unbiasedness with intervals, and the variance decomposition.
+
+**Most promising methods to adopt**, ranked by expected gain and feasibility:
+
+1. **Balanced or fixed-size stopping decisions** (Hájek 1964; the cube method, Deville and
+   Tillé 2004; stratified truncation levels, Vihola 2018). See below.
+2. **A weight window plus skew-aware intervals.** A weight window (Vorba and Křivánek 2016)
+   floors P_k so that no weighted increment exceeds a cap W, P_k ≥ max(f, 1 - f) / W.
+   Skew-aware intervals are Johnson's t or bootstrap-t / BCa. This targets the coverage loss
+   seen under online correction.
+3. **A PPI++-style variance-tuned predictor** (arXiv 2311.01453), a + b f fitted on earlier
+   tasks, with a fallback to full runs when estimated relative compute exceeds 1. This targets
+   the weak-agent worst case.
+4. **Adaptive task order for ability** (IRT adaptive testing; tinyBenchmarks, arXiv
+   2402.14992). Run first the tasks that are most informative about theta per unit of cost.
+5. **Finite-sample intervals** (betting, Waudby-Smith and Ramdas). Valid at any n, but wider;
+   use them as a check.
+
+Splitting (re-running uncertain runs) attacks only luck, and trajectory verifiers are capped:
+perfect in-run predictions give 40.8% against 49.8% on the leaderboard.
+
+**Premise check for balanced decisions** (one-shot, 5% of runs finished, exact). Independent
+coin flips are Poisson sampling, so the step-0 term pays the uncentred E[(Y - f0)^2]. A fixed
+number of finished runs pays only the variance of Y - f0, and fixed numbers within groups of
+similar f0 pay only its within-group variance. The agent's average miscalibration drops out by
+design, with no fitted correction and no extra skew.
+
+| One-shot, 5% finished | Verified: geo. mean | Worst agent | Leaderboard: geo. mean | Worst agent |
+| --- | --- | --- | --- | --- |
+| Independent coin flips (now) | 56.6% | 5.21x | 64.5% | 44.0x |
+| A fixed number of finished runs | 49.6% | 1.84x | 58.3% | 15.2x |
+| **A fixed number in each of 5 groups of similar f0** | **46.7%** | **0.92x** | **51.4%** | **1.68x** |
+| Balanced on f0 (regression residual) | 48.0% | 0.95x | 52.9% | 1.00x |
+
+This matches the oracle per-agent shift (44.5% one-shot on Verified) without knowing the agent.
+Two open steps:
+
+- **The per-step version.** Stratify each run's stopping uniform across runs with similar f0;
+  every run keeps its exact marginal stopping probability. It has to be measured by simulation.
+- **A design-based variance estimator.** Without one, the usual sd / sqrt(n) interval stays
+  valid but conservative and does not get narrower. Two-phase sampling variance formulas, or
+  random groups, are the candidates.
+
+Both sit on the estimator side, so this is joint work with Vedanti.
+
+## A second benchmark: the SWE-rebench leaderboard (Nov 20)
+
+`convert_rebench_lb.py` converts the Python subset of
+`nebius/SWE-rebench-leaderboard-trajectories`: 36 agent configurations (25 models; the common
+scaffold plus Claude Code, Codex, Cursor and Junie) on the same 110 fresh tasks, 5 runs per
+task (2 for the Claude Code effort panel). 18,468 runs, 1.0M steps, 46.9% resolved, gold
+patches for every task (`nebius/SWE-rebench-leaderboard`). Each tool call becomes one step,
+rewritten as the equivalent shell command; per-run token totals are spread over the steps in
+proportion to the characters/4 estimate. Resolve rates range from 0.7% to 63%.
+
+**LightGBM, each configuration held out** (`train_lgbm.py --data data/rebench_lb`; `task_rate`
+is now computed per task over all runs of the other configurations, unchanged for Verified):
+
+| Policy | Base, median / geo. mean | Gold, median / geo. mean | Gold coverage, mean / worst |
+| --- | --- | --- | --- |
+| One-shot | 53.8% / 65.0% | 53.5% / 64.5% | 94.4% / 90.6% |
+| Tracking | 48.9% / 59.4% | 49.1% / 57.8% | 94.8% / 92.0% |
+| Learned tracking | 51.2% / 60.6% | 50.8% / 59.5% | 94.7% / 92.4% |
+| Index | 50.9% / 61.9% | 52.2% / 60.6% | 94.7% / 93.4% |
+
+- The median matches SWE-bench Verified (about 48 to 50%) and coverage holds. Gold features
+  are 2 to 3% cheaper than base, within training noise.
+- The geometric mean is higher because of two very weak configurations; the worst (DeepSeek
+  V3.2 without demonstrations, 0.7% resolved) costs 44 times full runs, the weak-agent problem
+  in its extreme form: when almost every run fails, Var(Y) is tiny and any error dominates.
+
+**The deep dive replicates** (agents with 20 to 80% resolve rate): variance shares 15.1%
+outcome, 66.9% step-0 term, 17.9% in-run terms (Verified 14.8 / 67.6 / 17.6); compute 49.8%,
+16.3% with a perfect step-0 prediction, 40.8% with perfect in-run predictions; 11% of the
+step-0 uncertainty resolved one step before the end (Verified 13%); the last edit to a gold
+file comes at 33% of the run's tokens (median, runs where one is detected).
+
+**Luck, measured directly** (5 runs per task, `results/rebench_lb_luck.csv`): for the 34
+configurations with a 20 to 80% resolve rate, run-to-run variance is 0.074 (median), 30% of
+the outcome variance (13 to 45%); on 30% of tasks an agent's runs do not all agree.
+
+**A/B with a reference arm, on real one-change pairs** (`paired_rebench.py`): the reference
+configuration's per-task solve rate (over its runs) as an input to the variant's step-0
+prediction, combined with held-out LightGBM through a logistic regression fitted on the other
+pairs. One-shot compute, geometric mean over pairs in both directions:
+
+| Pair type | Pairs | Mean per-task rate gap | LightGBM | With reference arm | Luck floor |
+| --- | --- | --- | --- | --- | --- |
+| Same model and scaffold, another reasoning effort | 10 | 0.096 | 55.0% | **37.9%** | 28.8% |
+| Same model, another scaffold | 6 | 0.164 | 55.2% | 50.7% | 30.5% |
+| Same scaffold, neighbouring model version | 6 | 0.156 | 52.8% | 50.2% | 35.0% |
+| Configuration fix or provider change | 4 | 0.144 | 50.4% | 49.8% | 39.6% |
+| All | 26 | | 53.8% | **45.1%** | 32.1% |
+
+The reference arm helps in 21 of 26 directions, and the closer the arms, the more: for effort
+changes (same model, same scaffold, the closest analogue of a tool tweak) it cuts compute by
+31%, two thirds of the way to the floor that luck sets. With 5 runs per task the reference
+rate is much sharper than SWE-bench Verified's single run, which is why the gain here is
+larger than in `paired_check.py`.
+
 ## A theory note for contribution 3
 
 Training the predictor "to minimize the estimator's variance" and training it as an ordinary
@@ -293,7 +822,13 @@ levers above are information that arrives early and agent-level calibration.
 - Each comparison is one training run; the seed spread (up to 3.4%) is measured for gold
   LightGBM only.
 - Coverage numbers use 500 replicates (about ±1 point per agent); Vedanti's use 2,000.
-- No agent-adaptive predictor yet: the 13 to 15% is a bound (agent known from half its tasks,
-  or an oracle), not something achieved inside an evaluation.
-- The Nebius data is converted and featurized but not yet used; CoderForge is not converted.
+- Inside an evaluation, agent adaptation recovers about 10% (51.9% → 46.4% at floor 0.05)
+  of the 12 to 20% the bounds promise (45.5% agent known, 41.6% ability-aware with the true
+  rate), at a cost of about 1.5 points of coverage.
+- The paired checks use step-0 predictions and the one-shot formula only, and the pairs are
+  effort, scaffold and version changes, not tool changes; Rishi's runs are the real test.
+- The leaderboard's multilingual subset (Go, Java, Rust, TypeScript) is not converted: the
+  features' test-run patterns are Python-specific.
+- Nebius and CoderForge are used only to measure luck so far, not to train or test a
+  predictor.
 - No result yet on Rishi's runs.
