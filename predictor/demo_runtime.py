@@ -3,6 +3,7 @@
     python predictor/export.py runtime --exclude <agent>    # once: models without that agent
     python predictor/demo_runtime.py <agent> --seeds 20                     # both designs
     python predictor/demo_runtime.py <agent> --design standard              # or balanced
+    python predictor/demo_runtime.py <agent> --ensemble 3  # the seed-averaged models (export --seeds 3)
 
 Replays the agent's logged SWE-bench Verified runs through predictor/runtime.py exactly as a live
 harness would: plan the batch, then for every task ask should_continue() before each step, feed
@@ -64,11 +65,15 @@ def main() -> None:
     parser.add_argument("agent")
     parser.add_argument("--seeds", type=int, default=20)
     parser.add_argument("--design", choices=["standard", "balanced", "both"], default="both")
+    parser.add_argument("--ensemble", type=int, default=1,
+                        help="use the models averaged over this many seeds (export.py runtime --seeds N)")
     args = parser.parse_args()
 
-    model_dir = Path("data/predictor/runtime") / f"without_{args.agent}"
+    ens = f"_ens{args.ensemble}" if args.ensemble > 1 else ""
+    model_dir = Path("data/predictor/runtime") / f"without_{args.agent}{ens}"
     if not model_dir.exists():
-        raise SystemExit(f"run: python predictor/export.py runtime --exclude {args.agent}")
+        raise SystemExit(f"run: python predictor/export.py runtime --exclude {args.agent}"
+                         + (f" --seeds {args.ensemble}" if ens else ""))
     rt = Runtime.load(model_dir)
     assert args.agent not in rt.meta["training_agents"]
     runs = {task: steps for (task, _), steps in
@@ -77,7 +82,7 @@ def main() -> None:
     full_tokens = sum(st.tokens_in + st.tokens_out for s in runs.values() for st in s)
     full_half = 1.96 * np.sqrt(truth * (1 - truth) / len(runs))
     print(f"{args.agent}: {len(runs)} tasks, true resolve rate {truth:.3f}, "
-          f"half-width with full runs {full_half:.3f}")
+          f"half-width with full runs {full_half:.3f}, {len(rt.success_models)} success model(s)")
     for design in ["standard", "balanced"] if args.design == "both" else [args.design]:
         report(design, [evaluate_once(rt, runs, seed, design) for seed in range(args.seeds)],
                truth, full_tokens, full_half)

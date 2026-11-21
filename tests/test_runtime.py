@@ -104,3 +104,21 @@ def test_standard_design_reports_vedantis_interval():
 def test_unknown_design_is_rejected():
     with pytest.raises(ValueError):
         tiny_runtime().plan(["t0"], design="stratified")
+
+
+def test_seed_average_predicts_the_mean():
+    """A Runtime given several success models (export.py runtime --seeds N) averages them."""
+    rt = tiny_runtime()
+    rng = np.random.default_rng(1)
+    x = pd.DataFrame(rng.random((400, len(COLS))), columns=COLS)
+    other = lgb.train({"objective": "binary", "verbose": -1, "num_threads": 1, "min_data_in_leaf": 20},
+                      lgb.Dataset(x, (x["k"] > 0.3).astype(int)), 5)
+    both = Runtime([rt.success_models[0], other], rt.cost_model, rt.meta, gold={})
+    state = rt.tracker("t0")
+    for step in fake_run("t0", 3, 1):
+        state.update(vars(step))
+    f_first = rt.predict("t0", state)[0]
+    f_other = Runtime(other, rt.cost_model, rt.meta, gold={}).predict("t0", state)[0]
+    assert abs(both.predict("t0", state)[0] - (f_first + f_other) / 2) < 1e-12
+    plan = replay(both.plan(["t0", "t1"], seed=0), {t: fake_run(t, 3, 1) for t in ["t0", "t1"]})
+    assert plan.result()["tasks"] == 2

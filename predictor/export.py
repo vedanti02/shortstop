@@ -3,6 +3,7 @@
     python predictor/export.py coverage --split loao        # predictions for coverage/*.py
     python predictor/export.py runtime                      # models for a live harness
     python predictor/export.py runtime --exclude <agent>    # the same without one agent (demo)
+    python predictor/export.py runtime --seeds 3            # 3 success models, averaged -> all_ens3/
 
 coverage
     Copies data/predictor/predictions_gold_<split>.pkl (made by train_lgbm.py, gold features,
@@ -20,6 +21,10 @@ runtime
     run time. Saved to data/predictor/runtime/<name>/ with meta.json: feature lists, the task
     solve-rate and task-cost tables, and the policy settings (kappa tuned on held-out agents in
     cost_aware.py, the 0.05 floor, strata of 50). Load with predictor/runtime.py.
+
+    --seeds N trains N success models (seeds 0 to N-1, each with its own cross-fit halves) and
+    the runtime averages their predictions; they go to <name>_ens<N>/, next to the single-seed
+    models, and load the same way. The remaining-cost model stays a single seed.
 """
 
 from __future__ import annotations
@@ -51,7 +56,7 @@ def export_coverage(split: str) -> None:
     print(f"wrote {dst}; run: python coverage/experiments.py --data {dst.parent} --split {split}")
 
 
-def export_runtime(exclude: str | None, seed: int = 0) -> None:
+def export_runtime(exclude: str | None, seeds: int = 1, seed: int = 0) -> None:
     d = pd.read_pickle(FEATURES).sort_values(["agent", "task_id", "k"]).reset_index(drop=True)
     d["task"] = d["task_id"]
     outcomes = d[d["k"] == 0].pivot(index="task_id", columns="agent", values="outcome").dropna()
@@ -67,29 +72,35 @@ def export_runtime(exclude: str | None, seed: int = 0) -> None:
     d["task_cost"] = task_cost(d, rel_log_cost, agents, crossfit=True, seed=seed)
     success_cols = GROUPS["gold"]
     cost_cols = GROUPS["gold"] + ["task_cost"]
-    success = fit(d, success_cols, None, seed)
     train = d.sample(min(len(d), 400_000), random_state=seed)
     cost = fit_reg(train, cost_cols, "log_remaining", seed)
+    successes = []
+    for s in range(seed, seed + seeds):  # each seed with its own cross-fit halves, as in train_lgbm.py
+        d["task_rate"] = crossfit_task_rate(d, outcomes, agents, s)
+        successes.append(fit(d, success_cols, None, s))
 
     tuned = pd.read_csv(Path(__file__).parent / "results" / "cost_aware.csv")
     tuned = tuned[tuned["rule"] == "+ predicted cost"]
     kappa = float(tuned.loc[tuned["agent"] == exclude, "kappa"].iloc[0]) if exclude else \
         float(tuned["kappa"].mode().iloc[0])  # tuned without the excluded agent / the usual value
 
-    name = "all" if exclude is None else f"without_{exclude}"
+    name = ("all" if exclude is None else f"without_{exclude}") + (f"_ens{seeds}" if seeds > 1 else "")
     out = Path("data/predictor/runtime") / name
     out.mkdir(parents=True, exist_ok=True)
-    success.save_model(str(out / "success.txt"), num_iteration=success.best_iteration)
+    files = ["success.txt" if i == 0 else f"success_seed{seed + i}.txt" for i in range(seeds)]
+    for file, model in zip(files, successes):
+        model.save_model(str(out / file), num_iteration=model.best_iteration)
     cost.save_model(str(out / "cost.txt"), num_iteration=cost.best_iteration)
     task_rate = outcomes[agents].mean(axis=1)
-    meta = {"success_features": success_cols, "cost_features": cost_cols,
+    meta = {"success_features": success_cols, "cost_features": cost_cols, "success_models": files,
             "task_rate": task_rate.round(6).to_dict(), "default_task_rate": float(task_rate.mean()),
             "task_cost": rel_log_cost[agents].mean(axis=1).round(6).to_dict(), "default_task_cost": 0.0,
             "kappa": kappa, "floor": FLOOR, "block": BLOCK, "training_agents": agents,
             "gold_meta": ["data/meta/swebench_verified.parquet"]}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     print(f"wrote {out}: {len(agents)} training agents, kappa {kappa}, "
-          f"trees {success.best_iteration} (success) / {cost.best_iteration} (cost)")
+          f"trees {'/'.join(str(m.best_iteration) for m in successes)} (success) / "
+          f"{cost.best_iteration} (cost)")
 
 
 def main() -> None:
@@ -97,11 +108,12 @@ def main() -> None:
     parser.add_argument("what", choices=["coverage", "runtime"])
     parser.add_argument("--split", default="loao", help="coverage: loao, lofo or temporal")
     parser.add_argument("--exclude", help="runtime: an agent to leave out of training")
+    parser.add_argument("--seeds", type=int, default=1, help="runtime: success models to train and average")
     args = parser.parse_args()
     if args.what == "coverage":
         export_coverage(args.split)
     else:
-        export_runtime(args.exclude)
+        export_runtime(args.exclude, args.seeds)
 
 
 if __name__ == "__main__":

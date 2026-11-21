@@ -19,7 +19,8 @@ run (lower is better):
 | + balanced stopping: the runtime's `balanced` design, error bars not yet proven | 43.2% | 48.0% |
 
 In Vedanti's own simulation (`evaluate.py`), the tracking rule needs 55.9% with her stand-in
-predictor and 53.0% with LightGBM.
+predictor and 53.0% with LightGBM. With the optional seed-averaged models, the three Verified
+numbers drop to 50.8%, 47.1% and 42.7%.
 
 **What worked**
 
@@ -36,7 +37,8 @@ predictor and 53.0% with LightGBM.
 note shows it cannot win), learning the agent's strength during the evaluation (it ties
 Vedanti's simpler correction), priors from the same model family, and more training data
 (OpenHands runs, a solve rate from 128 leaderboard systems, SWE-rebench runs). Averaging three
-training seeds is the one training change with a small, reliable gain (0.6 to 1.7%).
+training seeds is the one training change with a small, reliable gain, about 1% on every setup;
+it is an option (`--seeds 3`) next to the single-seed models.
 
 **Why** (the deep dive):
 
@@ -129,7 +131,12 @@ The score is exactly unbiased under both designs (Lemma 1); only the interval di
 
 ```bash
 python predictor/export.py runtime     # trains on all 37 agents -> data/predictor/runtime/all/
+python predictor/export.py runtime --seeds 3   # optional: 3 seed-averaged models -> runtime/all_ens3/
 ```
+
+To use the seed-averaged models, load `data/predictor/runtime/all_ens3` instead of
+`data/predictor/runtime/all`. They work with either design, cost about 1% less compute (see
+"Does more training data help?"), and each prediction calls three models instead of one.
 
 **Step 2. Plan the batch with one design.** List every task before the first run starts: both
 designs measure each run's remaining cost against the batch's average, and `balanced` also
@@ -213,17 +220,25 @@ In `results/balanced.csv` the standard design is the rows with policy `cost-awar
   `coverage/features.py` on the import path.
 
 **End to end on real runs of agents the models never saw** (`demo_runtime.py`, models from
-`export.py runtime --exclude <agent>`, 20 complete evaluations per design, same seeds):
+`export.py runtime --exclude <agent>`, 20 complete evaluations per design, same seeds; the
+3-seed rows use `--seeds 3` models and `demo_runtime.py --ensemble 3`). With full runs the
+half-widths would be 0.040 (Sonnet) and 0.038 (gpt-oss-120b).
 
-| Held-out agent | Design | True rate | Mean score (sd) | Interval contains truth | Half-width (full runs) | Tokens spent | Compute for the reported width |
+| Held-out agent (true rate) | Design | Models | Mean score (sd) | Interval contains truth | Half-width | Tokens spent | Compute for the reported width |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| claude-4.5-sonnet-high | standard | 0.714 | 0.716 (0.030) | 20 / 20 | 0.083 (0.040) | 7.3% | 32% |
-| | balanced | | 0.717 (0.035) | 19 / 20 | 0.077 (0.040) | 7.5% | 28% |
-| gpt-oss-120b | standard | 0.260 | 0.271 (0.073) | 19 / 20 | 0.135 (0.038) | 9.5% | 118% |
-| | balanced | | 0.266 (0.045) | 20 / 20 | 0.110 (0.038) | 9.6% | 79% |
+| claude-4.5-sonnet-high (0.714) | standard | 1 seed | 0.716 (0.030) | 20 / 20 | 0.083 | 7.3% | 32% |
+| | standard | 3 seeds | 0.715 (0.031) | 20 / 20 | 0.083 | 7.3% | 32% |
+| | balanced | 1 seed | 0.717 (0.035) | 19 / 20 | 0.077 | 7.5% | 28% |
+| | balanced | 3 seeds | 0.717 (0.030) | 20 / 20 | 0.076 | 7.6% | 28% |
+| gpt-oss-120b (0.260) | standard | 1 seed | 0.271 (0.073) | 19 / 20 | 0.135 | 9.5% | 118% |
+| | standard | 3 seeds | 0.266 (0.069) | 19 / 20 | 0.133 | 9.7% | 116% |
+| | balanced | 1 seed | 0.266 (0.045) | 20 / 20 | 0.110 | 9.6% | 79% |
+| | balanced | 3 seeds | 0.263 (0.045) | 20 / 20 | 0.105 | 9.7% | 72% |
 
 - **Twenty evaluations are few.** The offline simulation (1,000 replicates, `results/balanced.csv`)
   gives 29% (standard) and 26% (balanced) for Sonnet, and 124% and 76% for gpt-oss-120b.
+- **The 3-seed models are the same or slightly cheaper.** The weaker agent gains most: its
+  balanced design drops from 79% to 72%.
 - **Under the standard design, gpt-oss-120b costs more than full runs.** The predictor, trained
   mostly on stronger agents, overrates it: its mean step-0 prediction is 0.62 against a true
   rate of 0.26. The balanced design cancels that misjudgment within each stratum, and
@@ -270,6 +285,7 @@ EOF
 python predictor/step_features.py                     # about 1 minute (10 workers by default)
 python predictor/train_lgbm.py --features gold --split loao     # about 3 minutes
 python predictor/evaluate.py data/predictor/predictions_gold_loao.pkl --name lgbm_gold_loao
+python predictor/train_lgbm.py --features gold --split loao --seeds 0,1,2 --tag ens3   # optional: seed average
 ```
 
 **2. The stopping rule and the two designs**
@@ -283,6 +299,7 @@ python predictor/balanced.py --blocks 25,50 --replicates 1000   # both designs -
 
 ```bash
 python predictor/export.py runtime                    # models for a live harness -> data/predictor/runtime/all/
+python predictor/export.py runtime --seeds 3          # optional: the seed-averaged models -> runtime/all_ens3/
 python predictor/export.py runtime --exclude <agent>  # the same without one agent
 python predictor/demo_runtime.py <agent>              # replay that agent under both designs
 python predictor/export.py coverage --split loao      # predictions in Vedanti's format
@@ -324,7 +341,7 @@ at the top of the file.
 | `convert_rebench_lb.py` | SWE-rebench leaderboard runs (36 configurations, 5 runs per task) into the shared format |
 | `step_features.py` | One row per step: Vedanti's counts (identical values), plus *process* features (last test result, steps since the last edit, reproduction scripts, repeated commands, format errors) and *gold* features (has the agent viewed or edited the files the reference patch touches, has it run the tests that must pass) |
 | **Predictors** | |
-| `train_lgbm.py` | LightGBM, one model per held-out agent; feature groups `base` / `process` / `gold`; splits `loao` / `lofo` / `temporal` / `insample` / `agentseen` / `agentseen_id`; `--data` for another benchmark |
+| `train_lgbm.py` | LightGBM, one model per held-out agent; feature groups `base` / `process` / `gold`; splits `loao` / `lofo` / `temporal` / `insample` / `agentseen` / `agentseen_id`; `--data` for another benchmark; `--seeds 0,1,2` averages several seeds |
 | `variance_weights.py` | Row weights that make the training loss equal to the estimator's variance (THEORY.md, Lemma 2) |
 | `train_ability.py` | Ability-aware predictor: the agent's resolve rate is an input, on top of a uniform logit shift |
 | `extra_data_check.py` | The held-out predictor with another dataset's runs added to training (OpenHands or SWE-rebench) |
@@ -346,9 +363,9 @@ at the top of the file.
 | `paired_check.py` | Premise check for tool A/B tests: a fully run reference arm as a predictor input |
 | `paired_rebench.py` | A/B reference-arm check on the leaderboard's real one-change pairs |
 | **Integration** | |
-| `export.py` | Predictions for coverage/ (`coverage`) and deployable models for a live harness (`runtime`) |
+| `export.py` | Predictions for coverage/ (`coverage`) and deployable models for a live harness (`runtime`; `--seeds 3` for the seed-averaged models) |
 | `runtime.py` | Run-time interface: predictions, cost-aware stopping, estimate and interval, under either design (`standard` or `balanced`) |
-| `demo_runtime.py` | Replays a held-out agent's logged runs through `runtime.py` as a live harness would, under both designs |
+| `demo_runtime.py` | Replays a held-out agent's logged runs through `runtime.py` as a live harness would, under both designs (`--ensemble 3` for the seed-averaged models) |
 
 ## Learned remaining cost: a trained component that beats the hand-made policies
 
@@ -1148,11 +1165,26 @@ per policy, and 11 to 26 of the 37 agents come out cheaper by chance.
 - **SWE-rebench runs give no reliable gain.** One-shot and learned tracking are 0.6 to 1.4%
   cheaper at every seed, but tracking and index flip between seeds, the averaged models are 0.8%
   costlier under tracking, and the worst agent gets worse.
-- **Averaging seeds is the one reliable training gain.** The average of the three baseline seeds'
-  predictions (a one-line step, not in a script) has step-0 Brier 0.1260; for squared error the
-  average can never be worse than the typical single run. It needs 0.6 to 1.7% less compute than
-  the mean of the three single runs (one-shot 0.6%, learned tracking 0.9%, index 1.4%, tracking
-  1.7%), and removes the seed lottery. `export.py runtime` still trains a single seed.
+- **Averaging seeds is the one reliable training gain.** Averaging the predictions of models
+  trained with seeds 0, 1 and 2 gives step-0 Brier 0.1260; for squared error the average can
+  never be worse than the typical single run. Under Vedanti's policies it needs 0.6 to 1.7% less
+  compute than the mean of the three single runs (one-shot 0.6%, learned tracking 0.9%, index
+  1.4%, tracking 1.7%), and it removes the seed lottery.
+
+**The seed average as a setup.** `train_lgbm.py --seeds 0,1,2` (offline) and
+`export.py runtime --seeds 3` (runtime) make it an option next to the single-seed models, and it
+works with either design. Only the success predictor is averaged; the remaining-cost model stays a
+single seed. On SWE-bench Verified (37 held-out agents, 1,000 replicates) it lowers every setup by
+about 1%, with coverage unchanged:
+
+| Setup (compute for the reported width) | Single seed | 3-seed average | Agents cheaper | Worst agent |
+| --- | --- | --- | --- | --- |
+| Baseline: LightGBM + tracking | 51.3% | 50.8% | 27 of 37 | 4.30x → 4.04x |
+| Standard design (learned remaining cost) | 47.7% | 47.1% | 25 of 37 | 2.95x → 2.73x |
+| Balanced design | 43.2% | 42.7% | 28 of 37 | 1.27x → 1.15x |
+
+The replays of two held-out agents (under "How to use it") agree. It has not been run on the
+SWE-rebench leaderboard.
 
 ```bash
 python predictor/extra_data_check.py --source openhands --rows 250000 --tag oh250k   # and 786000 / oh786k
@@ -1160,6 +1192,10 @@ python predictor/extra_data_check.py --source rebench --rows 786000 --tag rb786k
 python predictor/leaderboard_rate_check.py fetch
 python predictor/leaderboard_rate_check.py train
 python predictor/evaluate.py data/predictor/predictions_gold_loao_<tag>.pkl --name lgbm_gold_loao_<tag>
+python predictor/train_lgbm.py --features gold --split loao --seeds 0,1,2 --tag ens3    # the seed average
+python predictor/cost_aware.py --predictions data/predictor/predictions_gold_loao_ens3.pkl --name cost_aware_ens3
+python predictor/balanced.py --inputs data/predictor/cost_aware_ens3_inputs.pkl \
+    --kappas predictor/results/cost_aware_ens3.csv --name balanced_ens3 --blocks 50 --replicates 1000
 ```
 
 ## Literature survey: Monte Carlo methods and novelty

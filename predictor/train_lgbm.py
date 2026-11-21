@@ -15,6 +15,9 @@ the training agents) so it never depends on the row's own outcome; see crossfit_
 An optional --weights file gives one weight per (agent, task_id, k) row, used to train a
 predictor for a particular stopping policy (see variance_weights.py).
 
+--seeds 0,1,2 trains one model per seed and averages their predictions: less training noise
+(see "Does more training data help?" in predictor/README.md). Use it with --tag, e.g. --tag ens3.
+
 Output: data/predictor/predictions_<features>_<split>[_<tag>].pkl with Vedanti's columns.
 """
 
@@ -151,7 +154,9 @@ def main() -> None:
     parser.add_argument("--weights", type=Path, help="pickled Series of row weights")
     parser.add_argument("--tag", default="")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seeds", help="several seeds, comma-separated (e.g. 0,1,2): predictions are averaged")
     args = parser.parse_args()
+    seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
 
     features = pd.read_pickle(args.data / "features_rich.pkl")
     features["task"] = features["task_id"].str.split("@").str[0]  # repeated runs share a task
@@ -179,11 +184,12 @@ def main() -> None:
         part = features.loc[features["agent"] == agent, ["agent", "task_id", "k", "next_cost", "outcome"]].copy()
         if args.split.startswith("agentseen"):
             others = [a for a in agents if a != agent]
-            part["f"], rounds = predict_agent_seen(features, outcomes, agent, others, cols, args.seed,
-                                                   with_id=args.split == "agentseen_id")
+            runs = [predict_agent_seen(features, outcomes, agent, others, cols, s,
+                                       with_id=args.split == "agentseen_id") for s in seeds]
         else:
-            part["f"], rounds = predict_agent(features, outcomes, agent, train_agents, cols, weights,
-                                              args.seed)
+            runs = [predict_agent(features, outcomes, agent, train_agents, cols, weights, s) for s in seeds]
+        part["f"] = np.mean([f for f, _ in runs], axis=0)
+        rounds = "/".join(str(r) for _, r in runs)
         parts.append(part)
         first = part[part["k"] == 0]
         print(f"{agent}: true {first['outcome'].mean():.3f}, step-0 mean {first['f'].mean():.3f}, "

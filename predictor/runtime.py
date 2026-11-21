@@ -26,6 +26,10 @@ and differ only in how each run's stopping uniform is drawn and which interval i
 Either way every run's estimate is exactly unbiased (coverage/THEORY.md, Lemma 1), so the
 score is unbiased under both designs; only the interval differs.
 
+Either design runs with either set of models: `export.py runtime` saves one success model
+(data/predictor/runtime/all), `export.py runtime --seeds 3` saves three trained with different
+seeds (data/predictor/runtime/all_ens3), whose predictions are averaged. Both load the same way.
+
 What it does, per predictor/README.md:
   - f_k: the success prediction after k steps (gold LightGBM).
   - r_k: the expected tokens still to be spent (remaining-cost LightGBM), relative to the batch's
@@ -67,8 +71,10 @@ def as_dict(step) -> dict:
 
 
 class Runtime:
-    def __init__(self, success: lgb.Booster, cost: lgb.Booster, meta: dict, gold: dict):
-        self.success_model, self.cost_model, self.meta, self.gold = success, cost, meta, gold
+    def __init__(self, success, cost: lgb.Booster, meta: dict, gold: dict):
+        """success: one LightGBM model, or a list of them whose predictions are averaged."""
+        self.success_models = list(success) if isinstance(success, (list, tuple)) else [success]
+        self.cost_model, self.meta, self.gold = cost, meta, gold
 
     @classmethod
     def load(cls, path: str | Path) -> Runtime:
@@ -76,8 +82,8 @@ class Runtime:
         meta = json.loads((path / "meta.json").read_text())
         frames = [pd.read_parquet(p) for p in meta["gold_meta"] if Path(p).exists()]
         gold = gold_info(pd.concat(frames).drop_duplicates("instance_id")) if frames else {}
-        return cls(lgb.Booster(model_file=str(path / "success.txt")),
-                   lgb.Booster(model_file=str(path / "cost.txt")), meta, gold)
+        success = [lgb.Booster(model_file=str(path / f)) for f in meta.get("success_models", ["success.txt"])]
+        return cls(success, lgb.Booster(model_file=str(path / "cost.txt")), meta, gold)
 
     def tracker(self, task_id: str) -> RunFeatures:
         return RunFeatures(self.gold.get(task_id.split("@")[0]))
@@ -92,7 +98,8 @@ class Runtime:
     def predict(self, task_id: str, state: RunFeatures) -> tuple[float, float]:
         """(success probability, expected remaining tokens) after the steps the tracker has seen."""
         x = self._row(task_id, state)
-        f = float(self.success_model.predict(x[self.meta["success_features"]])[0])
+        xs = x[self.meta["success_features"]]
+        f = float(np.mean([m.predict(xs)[0] for m in self.success_models]))
         r = float(np.expm1(self.cost_model.predict(x[self.meta["cost_features"]])[0]))
         return min(max(f, 1e-4), 1 - 1e-4), max(r, 1.0)
 
