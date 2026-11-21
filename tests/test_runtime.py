@@ -4,9 +4,12 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pytest
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "coverage"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "predictor"))
-from runtime import Runtime
+from experiments import interval_stats
+from runtime import DESIGNS, Runtime
 from step_features import RunFeatures, run_rows
 from train_lgbm import GROUPS
 
@@ -55,10 +58,11 @@ def test_incremental_features_match_offline_rows():
         state.update(step)
 
 
-def test_live_loop_policy_and_estimate():
+@pytest.mark.parametrize("design", sorted(DESIGNS))
+def test_live_loop_policy_and_estimate(design):
     rt = tiny_runtime()
     runs = {f"t{i}": fake_run(f"t{i}", 3 + i % 4, i % 2) for i in range(12)}
-    plan = replay(rt.plan(list(runs), seed=1), runs)
+    plan = replay(rt.plan(list(runs), seed=1, design=design), runs)
     for run in plan.runs.values():
         assert all(0.05 <= p <= 1 for p in run.reach)
         assert all(a >= b for a, b in zip(run.reach, run.reach[1:]))  # never increases
@@ -66,18 +70,37 @@ def test_live_loop_policy_and_estimate():
         direct = run.f[0] + sum((run.f[k] - run.f[k - 1]) / run.reach[k - 1] for k in range(1, len(run.reach) + 1))
         assert abs(run.estimate() - direct) < 1e-12
     res = plan.result()
+    assert res["design"] == design
     assert res["interval"][0] <= res["score"] <= res["interval"][1]
     assert res["tasks"] == 12
 
 
-def test_live_loop_is_unbiased():
+@pytest.mark.parametrize("design", sorted(DESIGNS))
+def test_live_loop_is_unbiased(design):
     rt = tiny_runtime(kappa=1.5)
     runs = {f"t{i}": fake_run(f"t{i}", 4, i % 2) for i in range(8)}
     truth = np.array([steps[0].outcome for steps in runs.values()])
     est = []
     for seed in range(600):
-        plan = replay(rt.plan(list(runs), seed=seed), runs)
+        plan = replay(rt.plan(list(runs), seed=seed, design=design), runs)
         est.append([plan.runs[t].estimate() for t in runs])
     est = np.array(est)
     sd = est.std(axis=0) / np.sqrt(len(est))
     assert np.all(np.abs(est.mean(axis=0) - truth) < 5 * sd + 1e-9)
+
+
+def test_standard_design_reports_vedantis_interval():
+    """The default design's interval is coverage/experiments.py's mean +/- 1.96 sd / sqrt(n)."""
+    rt = tiny_runtime()
+    runs = {f"t{i}": fake_run(f"t{i}", 3 + i % 4, i % 2) for i in range(12)}
+    plan = replay(rt.plan(list(runs), seed=2), runs)
+    res = plan.result()
+    est = np.array([plan.runs[t].estimate() for t in runs])
+    assert res["design"] == "standard"
+    assert abs(res["score"] - est.mean()) < 1e-12
+    assert abs(res["half_width"] - interval_stats(est[None, :], 0.5)["ci_half_width"]) < 1e-12
+
+
+def test_unknown_design_is_rejected():
+    with pytest.raises(ValueError):
+        tiny_runtime().plan(["t0"], design="stratified")

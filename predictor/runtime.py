@@ -12,17 +12,28 @@
                 break
     result = plan.result()     # unbiased score, 95% interval, tokens spent, runs started
 
+Two interchangeable designs. They share the predictor, the cost model and the stopping policy,
+and differ only in how each run's stopping uniform is drawn and which interval is reported:
+
+    rt.plan(task_ids, design="standard")    the default
+        Independent uniforms, and Vedanti's interval mean +/- 1.96 sd / sqrt(n)
+        (coverage/experiments.py). Proven: coverage/THEORY.md, Theorem 2a.
+    rt.plan(task_ids, design="balanced")
+        Uniforms spread evenly within strata of runs with similar step-1 reach probability, and
+        the design-based interval of predictor/balanced.py. A narrower interval for the same
+        tokens; validated by simulation on two benchmarks, but not yet proven.
+
+Either way every run's estimate is exactly unbiased (coverage/THEORY.md, Lemma 1), so the
+score is unbiased under both designs; only the interval differs.
+
 What it does, per predictor/README.md:
   - f_k: the success prediction after k steps (gold LightGBM).
   - r_k: the expected tokens still to be spent (remaining-cost LightGBM), relative to the batch's
     mean at step 0.
   - The reach probability for the next step is min(previous, clip(kappa sqrt(f (1 - f) / r),
     floor, 1)): the learned-remaining-cost policy.
-  - The plan spreads the runs' stopping uniforms evenly within strata of runs with similar step-1
-    reach probability (balanced decisions); each run's uniform is still uniform, so every run's
-    estimate is exactly unbiased (coverage/THEORY.md, Lemma 1).
   - result() averages the randomized-truncation estimates (shortstop.rr_estimate) and gives the
-    design-based interval of predictor/balanced.py.
+    design's interval.
 
 The models are trained on SWE-bench Verified agents. Task features (how often those agents solved
 the task, the gold patch) exist for Verified tasks; for other tasks the predictions fall back to
@@ -47,6 +58,8 @@ from balanced import design_variance, stratified_uniforms
 from step_features import RunFeatures, gold_info
 
 from shortstop import rr_estimate
+
+Z = 1.96  # the normal quantile of coverage/experiments.py
 
 
 def as_dict(step) -> dict:
@@ -96,8 +109,12 @@ class Runtime:
         k, floor = self.meta["kappa"], self.meta["floor"]
         return float(np.clip(k * np.sqrt(f * (1 - f) / max(r_rel, 1e-6)), floor, 1.0))
 
-    def plan(self, task_ids: list[str], seed: int = 0) -> Plan:
-        return Plan(self, task_ids, np.random.default_rng(seed))
+    def plan(self, task_ids: list[str], seed: int = 0, design: str = "standard") -> Plan:
+        """Plan a batch: design "standard" (independent stopping, proven interval) or "balanced"
+        (balanced stopping, design-based interval, not yet proven). See the module docstring."""
+        if design not in DESIGNS:
+            raise ValueError(f"design must be one of {sorted(DESIGNS)}, not {design!r}")
+        return DESIGNS[design](self, task_ids, np.random.default_rng(seed))
 
 
 class Run:
@@ -146,17 +163,25 @@ class Run:
 
 
 class Plan:
+    """One evaluation batch. The two designs below differ only in uniforms() and half_width()."""
+
+    design = ""
+
     def __init__(self, rt: Runtime, task_ids: list[str], rng):
         self.rt, self.task_ids = rt, list(task_ids)
         self.step0 = {t: rt.predict(t, rt.tracker(t)) for t in self.task_ids}
         self.scale = float(np.mean([r for _, r in self.step0.values()]))
         self.p1 = {t: rt.target(f, r / self.scale) for t, (f, r) in self.step0.items()}
-        p1 = np.array([self.p1[t] for t in self.task_ids])[None, :]
-        f0 = np.array([self.step0[t][0] for t in self.task_ids])[None, :]
-        u, strata = stratified_uniforms(p1, f0, rt.meta["block"], rng)
-        self.u = dict(zip(self.task_ids, u[0]))
-        self.stratum = dict(zip(self.task_ids, strata[0]))
+        self.u = dict(zip(self.task_ids, self.uniforms(rng)))
         self.runs: dict[str, Run] = {}
+
+    def uniforms(self, rng) -> np.ndarray:
+        """Each run's stopping uniform, in task order."""
+        raise NotImplementedError
+
+    def half_width(self, ids: list[str], runs: list[Run], est: np.ndarray) -> float:
+        """Half-width of the 95% interval around the mean of the per-run estimates est."""
+        raise NotImplementedError
 
     def start(self, task_id: str) -> Run:
         self.runs[task_id] = Run(self, task_id, float(self.u[task_id]))
@@ -165,15 +190,48 @@ class Plan:
     def result(self) -> dict:
         ids = [t for t in self.task_ids if t in self.runs]
         runs = [self.runs[t] for t in ids]
-        n = len(runs)
-        est = np.array([r.estimate() for r in runs])[None, :]
-        f0 = np.array([r.f[0] for r in runs])[None, :]
-        p1 = np.array([self.p1[t] for t in ids])[None, :]
-        started = np.array([len(r.reach) > 0 for r in runs])[None, :]
-        stratum = np.array([self.stratum[t] for t in ids])[None, :]
-        _, var, df = design_variance(est, f0, p1, started, stratum, n)
-        half = float(student_t.ppf(0.975, df[0]) * np.sqrt(var[0]))
+        est = np.array([r.estimate() for r in runs])
+        half = self.half_width(ids, runs, est)
         score = float(est.mean())
-        return {"score": score, "interval": (score - half, score + half), "half_width": half,
-                "tasks": n, "runs_started": int(started.sum()),
+        return {"design": self.design, "score": score, "interval": (score - half, score + half),
+                "half_width": half, "tasks": len(runs), "runs_started": int(sum(len(r.reach) > 0 for r in runs)),
                 "runs_finished": int(sum(r.finished for r in runs)), "tokens": int(sum(r.tokens for r in runs))}
+
+
+class StandardPlan(Plan):
+    """Independent stopping uniforms and Vedanti's interval, mean +/- 1.96 sd / sqrt(n)
+    (coverage/experiments.py, interval_stats), proven in coverage/THEORY.md, Theorem 2a."""
+
+    design = "standard"
+
+    def uniforms(self, rng) -> np.ndarray:
+        return rng.random(len(self.task_ids))
+
+    def half_width(self, ids: list[str], runs: list[Run], est: np.ndarray) -> float:
+        return float(Z * est.std(ddof=1) / np.sqrt(len(est)))
+
+
+class BalancedPlan(Plan):
+    """Stopping uniforms spread evenly within strata of meta["block"] runs sorted by (P_1, f0),
+    and the design-based interval of predictor/balanced.py (validated by simulation on two
+    benchmarks; not yet proven)."""
+
+    design = "balanced"
+
+    def uniforms(self, rng) -> np.ndarray:
+        p1 = np.array([self.p1[t] for t in self.task_ids])[None, :]
+        f0 = np.array([self.step0[t][0] for t in self.task_ids])[None, :]
+        u, strata = stratified_uniforms(p1, f0, self.rt.meta["block"], rng)
+        self.stratum = dict(zip(self.task_ids, strata[0]))
+        return u[0]
+
+    def half_width(self, ids: list[str], runs: list[Run], est: np.ndarray) -> float:
+        def row(values) -> np.ndarray:
+            return np.asarray(values)[None, :]
+        _, var, df = design_variance(row(est), row([r.f[0] for r in runs]), row([self.p1[t] for t in ids]),
+                                     row([len(r.reach) > 0 for r in runs]), row([self.stratum[t] for t in ids]),
+                                     len(runs))
+        return float(student_t.ppf(0.975, df[0]) * np.sqrt(var[0]))
+
+
+DESIGNS = {"standard": StandardPlan, "balanced": BalancedPlan}

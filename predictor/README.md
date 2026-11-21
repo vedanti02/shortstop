@@ -50,8 +50,8 @@ python predictor/step_features.py --data data/openhands \
 | `cost_models.py` | Which loss for the remaining-cost model (log squared error, Tweedie, gamma, smearing) |
 | `balanced.py` | Balanced (stratified) stopping uniforms and a design-based interval, with either policy |
 | `export.py` | Predictions for coverage/ (`coverage`) and deployable models for a live harness (`runtime`) |
-| `runtime.py` | Run-time interface: predictions, cost-aware stopping, balanced plan, estimate and interval |
-| `demo_runtime.py` | Replays a held-out agent's logged runs through `runtime.py` as a live harness would |
+| `runtime.py` | Run-time interface: predictions, cost-aware stopping, estimate and interval, under either design (`standard` or `balanced`) |
+| `demo_runtime.py` | Replays a held-out agent's logged runs through `runtime.py` as a live harness would, under both designs |
 
 ## The metric, and a formula that explains most of it
 
@@ -557,55 +557,140 @@ there. The same predictions scored with her policies are already in
 same 31 agents as hers; tracking needs a median of 56.7% of full-run compute there, against
 63% for the stand-in.
 
-### For a live harness (Rishi's plug-in)
+### For a live harness (Rishi's plug-in): two designs
 
 `runtime.py` runs everything at evaluation time: the success prediction, the learned remaining
-cost, the cost-aware stopping policy, the balanced plan, and the estimate with its design-based
-interval.
+cost, the cost-aware stopping policy, and the score with its 95% interval. It has two designs,
+picked with the `design` argument. They share the models and the stopping policy and differ in
+two things only: how the stop/continue draws are made, and which interval is reported.
+
+| | `design="standard"` (default) | `design="balanced"` |
+| --- | --- | --- |
+| Stop/continue draws | Independent for each run | Spread evenly within groups of 50 runs with similar predictions |
+| Interval | mean ± 1.96 sd / √n, Vedanti's (`coverage/experiments.py`) | Design-based, with a t quantile (`balanced.py: design_variance`) |
+| Proven? | Yes: `coverage/THEORY.md`, Theorem 2a | Not yet: validated by simulation on both benchmarks |
+| Compute for the reported width, Verified / SWE-rebench | 47.7% / 52.4% | 43.2% / 48.0% |
+| Agents costing more than full runs (Verified) | 2 of 37 | 1 of 37 |
+
+The score is exactly unbiased under both designs (Lemma 1); only the interval differs.
+
+**Which one to use.**
+
+- **`standard`** for numbers you report as final, such as the paper and the poster: its interval
+  is proven. It is the default, so nobody uses the unproven interval by accident.
+- **`balanced`** when narrower intervals for the same tokens matter more than a proof. It is
+  also much cheaper for agents the predictor misjudges, such as agents much weaker than the 37
+  training agents (gpt-oss-120b: 76% of full-run compute, against 124% under `standard`). Label
+  its intervals "design-based, not yet proven".
+- **Comparing agents or tool versions:** use the same design for every arm, so the intervals
+  mean the same thing.
+
+**Step 1. Build the models once.**
 
 ```bash
 python predictor/export.py runtime     # trains on all 37 agents -> data/predictor/runtime/all/
 ```
 
+**Step 2. Plan the batch with one design.** List every task before the first run starts: both
+designs measure each run's remaining cost against the batch's average, and `balanced` also
+groups similar runs. A plan keeps its design for the whole batch, and the same seed gives the
+same draws.
+
 ```python
 from runtime import Runtime
 rt = Runtime.load("data/predictor/runtime/all")
-plan = rt.plan(task_ids, seed=0)              # all tasks of a batch, before any run starts
+plan = rt.plan(task_ids, seed=0)                        # standard
+plan = rt.plan(task_ids, seed=0, design="balanced")     # or balanced
+```
+
+**Step 3. Run the agent.** This code is the same for both designs.
+
+```python
 for task_id in task_ids:
     run = plan.start(task_id)
-    while run.should_continue():              # decided before every agent step
-        step = ...                            # one agent step: a shortstop.Step or a dict of its fields
+    while run.should_continue():      # asked before every agent step
+        step = ...                    # one agent step: a shortstop.Step or a dict of its fields
         run.observe(step)
         if submitted:
-            run.finish(outcome)               # 0 or 1, from the benchmark's tests
+            run.finish(outcome)       # 0 or 1, from the benchmark's tests
             break
-print(plan.result())   # score, 95% interval, tokens, runs started and finished
 ```
+
+**Step 4. Read the result.** Real output, from replaying claude-4.5-sonnet-high (true resolve
+rate 0.714) with models that never saw it, seed 0:
+
+```python
+plan.result()
+# standard: {'design': 'standard', 'score': 0.703, 'interval': (0.619, 0.787), 'half_width': 0.084,
+#            'tasks': 500, 'runs_started': 69, 'runs_finished': 31, 'tokens': 35579545}
+# balanced: {'design': 'balanced', 'score': 0.701, 'interval': (0.620, 0.782), 'half_width': 0.081,
+#            'tasks': 500, 'runs_started': 77, 'runs_finished': 34, 'tokens': 37856874}
+```
+
+`runs_started` counts runs that took at least one step, `runs_finished` those that ran to the
+end, and `tokens` the total spent: 6.7% and 7.1% of the 530 million that full runs cost.
+
+**Try both before going live.** `demo_runtime.py` replays a held-out agent's logged runs
+through the runtime, exactly as a live harness would:
+
+```bash
+python predictor/export.py runtime --exclude <agent>     # models that never saw <agent>
+python predictor/demo_runtime.py <agent>                  # both designs, 20 evaluations each
+python predictor/demo_runtime.py <agent> --design balanced
+```
+
+**Each design's offline numbers.** `balanced.py` simulates both designs, after `cost_aware.py`
+has written its inputs:
+
+```bash
+python predictor/balanced.py --blocks 25,50 --replicates 1000                  # Verified
+python predictor/balanced.py --inputs data/predictor/cost_aware_rebench_inputs.pkl \
+    --kappas predictor/results/cost_aware_rebench.csv --name balanced_rebench --blocks 50 --replicates 1000
+```
+
+In `results/balanced.csv` the standard design is the rows with policy `cost-aware`, design
+`independent` and interval `naive`. The balanced design is policy `cost-aware`, design
+`stratified B=50` and interval `design + fpc`.
+
+**Details for both designs.**
 
 - **Step format.** Steps are in the shared format: actions with the command in a ```bash block,
   as mini-swe-agent writes them, and observations with `<returncode>`.
 - **Task features.** These exist for SWE-bench Verified tasks. Other tasks fall back to average
   difficulty: the estimate stays unbiased but costs more.
-- **Batch planning.** The balanced plan needs every task of a batch planned before the first run
-  starts. `rt.predictor(task_id)` gives the plain `shortstop.Predictor` interface.
+- **Plain predictor.** `rt.predictor(task_id)` gives the plain `shortstop.Predictor` interface.
 - **Two probability conventions.** `shortstop.rr_estimate` takes conditional continue
   probabilities, p_k = P(continue into step k | reached step k - 1). `coverage/stopping.py` and
   `runtime.py` work with P_k = P(reach step k). `runtime.py` converts before calling
   `rr_estimate`. Passing P_k directly double-counts and biases the estimate badly;
   `tests/test_runtime.py` caught this.
-- **Tests.** `tests/test_runtime.py` checks that the step features match the offline ones, that
-  the policy never increases and respects the floor, that the estimate matches the formula, and
-  that the live loop is unbiased.
+- **Tests.** `tests/test_runtime.py` checks, under both designs, that the policy never increases
+  and respects the floor, that the estimate matches the formula, and that the live loop is
+  unbiased. It also checks that the step features match the offline ones, that the standard
+  design's interval equals `interval_stats` in `coverage/experiments.py`, and that an unknown
+  design name is rejected.
 - **Name clash.** `step_features.py` was renamed from `features.py`, which clashed with
   `coverage/features.py` on the import path.
 
 **End to end on real runs of agents the models never saw** (`demo_runtime.py`, models from
-`export.py runtime --exclude <agent>`, 20 complete evaluations each):
+`export.py runtime --exclude <agent>`, 20 complete evaluations per design, same seeds):
 
-| Held-out agent | True rate | Mean score (sd) | Interval contains truth | Half-width (full runs) | Tokens spent | Compute for the reported width |
-| --- | --- | --- | --- | --- | --- | --- |
-| claude-4.5-sonnet-high | 0.714 | 0.717 (0.035) | 19 / 20 | 0.077 (0.040) | 7.5% | 28% |
-| gpt-oss-120b | 0.260 | 0.266 (0.045) | 20 / 20 | 0.110 (0.038) | 9.6% | 79% |
+| Held-out agent | Design | True rate | Mean score (sd) | Interval contains truth | Half-width (full runs) | Tokens spent | Compute for the reported width |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| claude-4.5-sonnet-high | standard | 0.714 | 0.716 (0.030) | 20 / 20 | 0.083 (0.040) | 7.3% | 32% |
+| | balanced | | 0.717 (0.035) | 19 / 20 | 0.077 (0.040) | 7.5% | 28% |
+| gpt-oss-120b | standard | 0.260 | 0.271 (0.073) | 19 / 20 | 0.135 (0.038) | 9.5% | 118% |
+| | balanced | | 0.266 (0.045) | 20 / 20 | 0.110 (0.038) | 9.6% | 79% |
+
+- **Twenty evaluations are few.** The offline simulation (1,000 replicates, `results/balanced.csv`)
+  gives 29% (standard) and 26% (balanced) for Sonnet, and 124% and 76% for gpt-oss-120b.
+- **Under the standard design, gpt-oss-120b costs more than full runs.** The predictor, trained
+  mostly on stronger agents, overrates it: its mean step-0 prediction is 0.62 against a true
+  rate of 0.26. The balanced design cancels that misjudgment within each stratum, and
+  independent stopping cannot.
+- **Agents above full-run cost.** Under the standard design 2 of 37 agents cost more than full
+  runs for the reported width: Qwen2.5-Coder-32B (9% resolve rate) at 2.9x, and gpt-oss-120b at
+  1.2x. Under the balanced design only Qwen2.5-Coder-32B does, at 1.3x.
 
 ## A trained component that beats the hand-made policies: learned remaining cost (Nov 20)
 
@@ -710,20 +795,35 @@ relative to full runs.
 | SWE-bench Verified (37 agents) | Actual | Reported | Coverage, mean / worst | Worst agent (actual) |
 | --- | --- | --- | --- | --- |
 | Tracking, independent stopping, sd / sqrt(n) (the baseline) | 53.3% | 51.3% | 94.4% / 91.9% | 4.79x |
-| Learned remaining cost, independent | 48.9% | 47.7% | 94.8% / 92.5% | 3.18x |
+| Learned remaining cost, independent, sd / sqrt(n) (`runtime.py` standard design) | 48.9% | 47.7% | 94.8% / 92.5% | 3.18x |
 | Tracking, balanced, design-based interval | 45.3% | 46.5% | 94.7% / 92.1% | 1.43x |
-| **Learned remaining cost, balanced, design-based interval** | **43.3%** | **43.2%** | **94.6% / 92.9%** | **1.11x** |
+| Learned remaining cost, balanced, sd / sqrt(n) | 43.3% | 47.8% | 95.9% / 93.7% | 1.11x |
+| **Learned remaining cost, balanced, design-based interval (`runtime.py` balanced design)** | **43.3%** | **43.2%** | **94.6% / 92.9%** | **1.11x** |
 
 | SWE-rebench leaderboard (36 configurations) | Actual | Reported | Coverage, mean / worst |
 | --- | --- | --- | --- |
 | Tracking, independent, sd / sqrt(n) | 58.2% | 57.0% | 94.7% / 92.4% |
-| Learned remaining cost, independent | 53.3% | 52.4% | 94.9% / 93.1% |
-| **Learned remaining cost, balanced, design-based interval** | **46.7%** | **48.0%** | **94.8% / 93.5%** |
+| Learned remaining cost, independent, sd / sqrt(n) (standard design) | 53.3% | 52.4% | 94.9% / 93.1% |
+| Learned remaining cost, balanced, sd / sqrt(n) | 46.7% | 52.5% | 96.0% / 94.3% |
+| **Learned remaining cost, balanced, design-based interval (balanced design)** | **46.7%** | **48.0%** | **94.8% / 93.5%** |
 
 The two improvements stack. Against the baseline they cut the compute for a given reported
 interval width by 16% on both benchmarks: the per-agent geometric-mean ratio is 0.842 on
 Verified (37 of 37 agents cheaper) and 0.843 on the leaderboard (35 of 36). Coverage matches
 the baseline's.
+
+**Without the design-based interval.** Balanced stopping makes the score more accurate under
+either interval: actual compute drops from 48.9% to 43.3% on Verified and from 53.3% to 46.7% on
+the leaderboard. Only the design-based interval shows it. With sd / sqrt(n) the reported width
+stays where the independent design's is (47.8% and 52.5%), and coverage rises to 96%, so the
+interval is wider than it needs to be. The design-based interval has no written proof yet, so
+`runtime.py` offers both as separate designs:
+
+- **`standard`** (the default): independent stopping and Vedanti's proven interval. About 7 to
+  8% cheaper than the baseline for the reported width (geometric-mean ratio 0.929 on Verified,
+  36 of 37 agents cheaper; 0.921 on the leaderboard, 33 of 36).
+- **`balanced`**: balanced stopping and the design-based interval, 16% cheaper, until its
+  proof is written.
 
 **Who gains** (Verified, final against baseline, geometric-mean ratio by resolve rate):
 
@@ -889,6 +989,9 @@ levers above are information that arrives early and agent-level calibration.
 
 ## What this does not show yet
 
+- The design-based interval of the balanced design is validated by simulation on two
+  benchmarks but has no written proof. `runtime.py` therefore defaults to the standard design,
+  whose interval Theorem 2a proves, and the 16% figure depends on the balanced design.
 - Policy tuning uses predictions for the training agents that came from models which saw
   the held-out agent (the same caveat as in `coverage/README.md`).
 - Each comparison is one training run; the seed spread (up to 3.4%) is measured for gold
