@@ -12,11 +12,13 @@ Within a stratum the number of runs started, and reaching each later step, becom
 fixed, so the stratum's average miscalibration largely cancels instead of entering the
 variance (the fixed-size effect checked in predictor/README.md, one-shot).
 
-The usual interval sd / sqrt(n) treats tasks as independent; under this design it stays valid
-but conservative. Two design-based variance estimators use the stratum totals T_h in sort
-order instead:
-    paired       sum over pairs of adjacent strata of (T_a - T_b)^2, t with H/2 df
-    successive   H / (2 (H - 1)) * sum_h (T_h - T_{h-1})^2, t with H - 1 df
+The usual interval sd / sqrt(n) treats tasks as independent; under this design it still covers
+in simulation but is too cautious. Two design-based variance estimators are compared:
+    design       design_variance(): theta (1 - theta) / n plus the within-stratum spread of the
+                 started runs' corrections, with and without the finite-population correction,
+                 t with sum (m - 1) df; runtime.py's balanced design uses it with the correction
+    successive   H / (2 (H - 1)) * sum_h (T_h - T_{h-1})^2 on the stratum totals T_h in sort
+                 order, t with H - 1 df
 
 Simulation as in coverage/adaptive.py: each replicate resamples the agent's tasks with
 replacement, applies the policy and the design, and builds the intervals. Policies are

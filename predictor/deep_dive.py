@@ -2,7 +2,8 @@
 
     python predictor/deep_dive.py
 
-Six analyses, each written to predictor/results/deep_dive_<name>.csv:
+Nine analyses, each written to predictor/results/deep_dive_<name>.csv (theta also writes
+theta_error):
 
     cost        Split each agent's estimator variance (coverage/THEORY.md, Lemma 2) into the
                 outcome's own variance, the part caused by the step-0 prediction, and the part
@@ -15,6 +16,9 @@ Six analyses, each written to predictor/results/deep_dive_<name>.csv:
     theta       Compute of the ability-aware predictor when its theta is off by a given amount,
                 and how far off the in-evaluation estimate of theta typically is.
     importance  What gold LightGBM relies on (share of total split gain).
+    edit_timing Share of a run's tokens spent by its last edit, and by its last edit to a file
+                the reference patch touches.
+    family      Whether a new agent's same-vendor siblings predict which tasks it solves.
 
 All policy-dependent numbers use the tracking policy at kappa 0.25 with a 0.05 floor, the
 setting of the simulations in predictor/README.md.
@@ -199,7 +203,8 @@ def main() -> None:
            "arrival": pd.concat([analysis_arrival(DATA / "predictions_gold_loao.pkl", "LightGBM gold"),
                                  analysis_arrival(DATA / "predictions_base_loao.pkl", "LightGBM base")]),
            "weighted": analysis_weighted(), "theta": analysis_theta(),
-           "theta_error": theta_error_curve(cost), "importance": analysis_importance()}
+           "theta_error": theta_error_curve(cost), "importance": analysis_importance(),
+           "edit_timing": analysis_edit_timing(), "family": analysis_family()}
     for name, df in out.items():
         df.to_csv(RESULTS / f"deep_dive_{name}.csv", index=False)
 
@@ -221,9 +226,6 @@ def main() -> None:
     print(out["theta_error"].round(3).to_string(index=False))
     print("\n== importance (top 10)"); print(out["importance"].head(10).round(3).to_string(index=False))
 
-
-if __name__ == "__main__":
-    main()
 
 
 def analysis_edit_timing() -> pd.DataFrame:
@@ -284,3 +286,7 @@ def analysis_family() -> pd.DataFrame:
                      "one_shot_lgbm": 0.05 + 0.95 * b_lgbm / y.var(),
                      "one_shot_family": 0.05 + 0.95 * b_fam / y.var()})
     return pd.DataFrame(rows)
+
+
+if __name__ == "__main__":
+    main()
