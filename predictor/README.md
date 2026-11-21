@@ -34,7 +34,9 @@ predictor and 53.0% with LightGBM.
 
 **What did not:** richer features inside the run, training on the variance objective (the theory
 note shows it cannot win), learning the agent's strength during the evaluation (it ties
-Vedanti's simpler correction), and priors from the same model family.
+Vedanti's simpler correction), priors from the same model family, and more training data
+(OpenHands runs, a solve rate from 128 leaderboard systems, SWE-rebench runs). Averaging three
+training seeds is the one training change with a small, reliable gain (0.6 to 1.7%).
 
 **Why** (the deep dive):
 
@@ -325,6 +327,8 @@ at the top of the file.
 | `train_lgbm.py` | LightGBM, one model per held-out agent; feature groups `base` / `process` / `gold`; splits `loao` / `lofo` / `temporal` / `insample` / `agentseen` / `agentseen_id`; `--data` for another benchmark |
 | `variance_weights.py` | Row weights that make the training loss equal to the estimator's variance (THEORY.md, Lemma 2) |
 | `train_ability.py` | Ability-aware predictor: the agent's resolve rate is an input, on top of a uniform logit shift |
+| `extra_data_check.py` | The held-out predictor with another dataset's runs added to training (OpenHands or SWE-rebench) |
+| `leaderboard_rate_check.py` | Downloads 128 SWE-bench Verified leaderboard systems' per-task results and adds their solve rate as a feature |
 | **Scoring** | |
 | `evaluate.py` | Scores any predictions file with Vedanti's five stopping policies, each tuned on the other agents, plus how much the prediction improves through the run |
 | `compare.py` | Paired comparison of predictors over the same held-out agents |
@@ -592,7 +596,8 @@ larger than in `paired_check.py`.
 The sections below are the detailed record behind the results above, roughly in the order the
 work was done: how the metric behaves and how much training noise there is, the checks on the
 predictor and the gate decision they led to, the agent-adaptive predictor, the deep dive into why
-a better-trained predictor did not help, the literature survey, and the theory note.
+a better-trained predictor did not help, the tests of more training data, the literature survey,
+and the theory note.
 
 ## The metric, and a formula that explains most of it
 
@@ -1096,6 +1101,67 @@ estimate is off by 0.06 to 0.13, which is why online it ties the plain correctio
   top of this README. Neither needs a better step-0 prediction: the first spends tokens where
   they buy the most certainty, and the second cancels the step-0 misjudgment within each group.
 
+## Does more training data help? (tested: no)
+
+`extra_data_check.py` and `leaderboard_rate_check.py`; tables in `results/lgbm_gold_loao_<run>_*.csv`.
+
+The deep dive says the predictor is limited by what can be known about a run, not by training.
+These tests check that directly. Each repeats the baseline exactly (gold LightGBM, leave one agent
+out, the same seed, validation agents and cross-fitted task rate) with one change, and scores the
+same 37 held-out Verified agents with `evaluate.py`:
+
+- **OpenHands runs** (Nebius and CoderForge, all from one model): 250K or 786K step rows of whole
+  runs added to training. Their tasks have no other agents, so the task solve rate is left
+  missing for them, and they are never used for early stopping.
+- **Leaderboard solve rate**: the share of 128 SWE-bench Verified leaderboard systems that solved
+  each task (from github.com/SWE-bench/experiments), added as a feature. Every mini-swe-agent
+  submission is left out, so the held-out agent's own result never enters; none of the rest
+  matches one of our agents on more than 91.6% of tasks. It correlates 0.92 with our agents' own
+  solve rate.
+- **SWE-rebench runs** (36 configurations): 250K or 786K step rows added, with the solve rate
+  cross-fitted across its configurations, exactly as for Verified.
+
+Retraining the unchanged baseline with seeds 1 and 2 shows the noise: compute moves by up to 1.8%
+per policy, and 11 to 26 of the 37 agents come out cheaper by chance.
+
+| Training data added | Step-0 Brier | Compute vs baseline (range over the four policies) | Verdict |
+| --- | --- | --- | --- |
+| None (baseline, seeds 0 to 2) | 0.1260 to 0.1278 | 0.984x to 1.018x | The noise yardstick |
+| OpenHands, 250K / 786K rows | 0.1274 / 0.1276 | 0.998x to 1.007x | No gain; the starting prediction is slightly worse for 29 of 37 agents |
+| Leaderboard solve rate | 0.1265 | 0.998x to 1.002x | No gain |
+| SWE-rebench, 250K / 786K rows | 0.1261 / 0.1263 | 0.989x to 0.995x | A small gain at seed 0, not confirmed below |
+
+**Seed check for SWE-rebench** (786K rows, compute against the baseline trained with the same seed):
+
+| Same-seed pair | Step-0 Brier, baseline → with SWE-rebench | One-shot | Tracking | Learned tracking | Index | Worst agent (tracking) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Seed 0 | 0.1267 → 0.1263 | 0.993x | 0.993x | 0.989x | 0.990x | 4.71x → 4.70x |
+| Seed 1 | 0.1260 → 0.1260 | 0.992x | 1.011x | 0.994x | 1.002x | 3.86x → 4.38x |
+| Seed 2 | 0.1278 → 0.1267 | 0.989x | 0.983x | 0.986x | 0.985x | 4.89x → 4.92x |
+| Average of the 3 seeds | 0.1260 → 0.1259 | 0.994x | 1.008x | 0.988x | 0.995x | 4.40x → 4.67x |
+
+- **OpenHands adds nothing.** More runs from one other agent, on unrelated tasks with no solve
+  rate, slightly blunt the starting prediction.
+- **The leaderboard solve rate adds nothing**, although it comes from 128 systems instead of 36
+  agents. Task difficulty is already measured well enough; what remains of the starting error is
+  which tasks this agent solves, and luck.
+- **SWE-rebench runs give no reliable gain.** One-shot and learned tracking are 0.6 to 1.4%
+  cheaper at every seed, but tracking and index flip between seeds, the averaged models are 0.8%
+  costlier under tracking, and the worst agent gets worse.
+- **Averaging seeds is the one reliable training gain.** The average of the three baseline seeds'
+  predictions (a one-line step, not in a script) has step-0 Brier 0.1260; for squared error the
+  average can never be worse than the typical single run. It needs 0.6 to 1.7% less compute than
+  the mean of the three single runs (one-shot 0.6%, learned tracking 0.9%, index 1.4%, tracking
+  1.7%), and removes the seed lottery. `export.py runtime` still trains a single seed.
+
+```bash
+python predictor/extra_data_check.py --source openhands --rows 250000 --tag oh250k   # and 786000 / oh786k
+python predictor/extra_data_check.py --source rebench --rows 786000 --tag rb786k     # seed check: --seed 1 or 2
+python predictor/leaderboard_rate_check.py fetch
+python predictor/leaderboard_rate_check.py train
+python predictor/evaluate.py data/predictor/predictions_gold_loao_<tag>.pkl --name lgbm_gold_loao_<tag>
+```
+
 ## Literature survey: Monte Carlo methods and novelty
 
 Citations were checked against arXiv, DOI records or publisher pages.
@@ -1215,6 +1281,6 @@ levers above are information that arrives early and agent-level calibration.
   effort, scaffold and version changes, not tool changes; Rishi's runs are the real test.
 - The leaderboard's multilingual subset (Go, Java, Rust, TypeScript) is not converted: the
   features' test-run patterns are Python-specific.
-- Nebius and CoderForge are used only to measure luck so far, not to train or test a
-  predictor.
+- Nebius and CoderForge were tested as extra training data and did not help (see "Does more
+  training data help?"); otherwise they are used to measure luck.
 - No result yet on Rishi's runs.
