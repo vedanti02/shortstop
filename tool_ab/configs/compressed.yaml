@@ -1,0 +1,11 @@
+# Tool change 3: compressed command outputs.
+#
+# Each output is cleaned before the model sees it (ANSI codes and progress bars removed,
+# repeated and blank lines collapsed, lines cut at 300 characters) and then cut to 4,000
+# characters, keeping the head and tail. See tool_ab/shortstop_plugin/compress.py. The
+# baseline only cuts outputs over 10,000 characters.
+agent:
+  compression:
+    max_chars: 4000
+    max_line_chars: 300
+    head_fraction: 0.6
