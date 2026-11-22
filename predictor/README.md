@@ -146,9 +146,31 @@ same draws.
 ```python
 from runtime import Runtime
 rt = Runtime.load("data/predictor/runtime/all")
+rt = rt.calibrate(earlier)   # optional: {task_id: 0 or 1} from earlier full runs of this agent
 plan = rt.plan(task_ids, seed=0)                        # standard
 plan = rt.plan(task_ids, seed=0, design="balanced")     # or balanced
 ```
+
+**Calibrating to the agent (optional).** The models expect an agent like the 37 they were
+trained on: their mean step-0 prediction is about 0.6, whatever the agent. `rt.calibrate(earlier)`
+moves every success prediction by one logit shift, chosen so that the mean step-0 prediction on
+those tasks equals the agent's solve rate there. `earlier` maps task ids to 0/1 outcomes from
+earlier full runs of the same agent; tasks outside the batch are fine. Calibrate before the batch
+starts and keep the shift fixed: it is then part of the predictor, so every run's estimate stays
+exactly unbiased.
+
+- **It matters most for agents unlike the training agents.** On Rishi's Qwen runs (26 to 40%
+  solved), the standard design's compute falls from 84–170% of full runs to 49–65%, and its
+  coverage rises from 86–88% to 94–96% (`tool_ab_check.py`; each half of the tasks is
+  calibrated on the other half).
+- **For a tool A/B test**, give both arms the same shift (the baseline's) and the same seed, so
+  their step-0 predictions and stopping draws match.
+- **Without earlier runs**, Vedanti's in-batch correction (`coverage/adaptive.py`) learns the
+  shift during the batch. On Qwen's 100 tasks it learns only about half of it: the baseline
+  arm's compute goes from 98% to 84% (tracking policy).
+- **The price of a uniform shift is at the tail.** On the 37 training agents its oracle version
+  saves 14 to 16% of compute, but the worst agent's coverage drops to 86–90% (see "Agent
+  calibration is the larger lever").
 
 **Step 3. Run the agent.** This code is the same for both designs.
 
@@ -158,10 +180,21 @@ for task_id in task_ids:
     while run.should_continue():      # asked before every agent step
         step = ...                    # one agent step: a shortstop.Step or a dict of its fields
         run.observe(step)
-        if submitted:
+        if run_over:                  # the agent submitted, or a step or cost limit was reached
             run.finish(outcome)       # 0 or 1, from the benchmark's tests
             break
 ```
+
+**When a step never completes.** A context overflow or a crash can end a run during a step,
+after `should_continue()` said yes. Call `run.finish(outcome)` without `observe()`: the attempted
+step then counts as the one that reveals the outcome. Writing the outcome over the last
+prediction instead would bias the estimate. Two more rules keep the loop honest:
+
+- Asking `should_continue()` again before the step is observed (a retry after a format error)
+  returns the same answer without a new draw.
+- The runtime refuses what would bias the score: `observe()` without asking first, `finish()`
+  on a run that was stopped, and `plan.result()` while a started run was neither stopped nor
+  finished.
 
 **Step 4. Read the result.** Real output, from replaying claude-4.5-sonnet-high (true resolve
 rate 0.714) with models that never saw it, seed 0:
@@ -169,13 +202,14 @@ rate 0.714) with models that never saw it, seed 0:
 ```python
 plan.result()
 # standard: {'design': 'standard', 'score': 0.703, 'interval': (0.619, 0.787), 'half_width': 0.084,
-#            'tasks': 500, 'runs_started': 69, 'runs_finished': 31, 'tokens': 35579545}
+#            'tasks': 500, 'runs_started': 69, 'runs_finished': 31, 'tokens': 35579545, 'shift': 0.0}
 # balanced: {'design': 'balanced', 'score': 0.701, 'interval': (0.620, 0.782), 'half_width': 0.081,
-#            'tasks': 500, 'runs_started': 77, 'runs_finished': 34, 'tokens': 37856874}
+#            'tasks': 500, 'runs_started': 77, 'runs_finished': 34, 'tokens': 37856874, 'shift': 0.0}
 ```
 
 `runs_started` counts runs that took at least one step, `runs_finished` those that ran to the
 end, and `tokens` the total spent: 6.7% and 7.1% of the 530 million that full runs cost.
+`shift` is the calibration shift, 0 without calibration.
 
 **Try both before going live.** `demo_runtime.py` replays a held-out agent's logged runs
 through the runtime, exactly as a live harness would:
@@ -205,6 +239,10 @@ In `results/balanced.csv` the standard design is the rows with policy `cost-awar
   as mini-swe-agent writes them, and observations with `<returncode>`.
 - **Task features.** These exist for SWE-bench Verified tasks. Other tasks fall back to average
   difficulty: the estimate stays unbiased but costs more.
+- **Gold patch table.** `Runtime.load` reads the table that `meta.json` names
+  (`data/meta/swebench_verified.parquet`) from the repo root, whatever the working directory, and
+  stops with an error if it is missing. Before, a missing table was skipped silently and every
+  prediction lost its task features.
 - **Plain predictor.** `rt.predictor(task_id)` gives the plain `shortstop.Predictor` interface.
 - **Two probability conventions.** `shortstop.rr_estimate` takes conditional continue
   probabilities, p_k = P(continue into step k | reached step k - 1). `coverage/stopping.py` and
@@ -213,9 +251,11 @@ In `results/balanced.csv` the standard design is the rows with policy `cost-awar
   `tests/test_runtime.py` caught this.
 - **Tests.** `tests/test_runtime.py` checks, under both designs, that the policy never increases
   and respects the floor, that the estimate matches the formula, and that the live loop is
-  unbiased. It also checks that the step features match the offline ones, that the standard
-  design's interval equals `interval_stats` in `coverage/experiments.py`, and that an unknown
-  design name is rejected.
+  unbiased, including runs that end during a step. It also checks that the step features match
+  the offline ones, that the standard design's interval equals `interval_stats` in
+  `coverage/experiments.py`, that an unknown design name is rejected, that the loop refuses
+  misuse, that calibration moves every prediction by one logit shift, and that a missing gold
+  patch table is an error.
 - **Name clash.** `step_features.py` was renamed from `features.py`, which clashed with
   `coverage/features.py` on the import path.
 
@@ -303,6 +343,7 @@ python predictor/export.py runtime --seeds 3          # optional: the seed-avera
 python predictor/export.py runtime --exclude <agent>  # the same without one agent
 python predictor/demo_runtime.py <agent>              # replay that agent under both designs
 python predictor/export.py coverage --split loao      # predictions in Vedanti's format
+python -I predictor/tool_ab_check.py                  # Rishi's tool A/B runs, unzipped into data/tool_ab/
 ```
 
 **4. The second benchmark: the SWE-rebench leaderboard**
@@ -366,6 +407,7 @@ at the top of the file.
 | `export.py` | Predictions for coverage/ (`coverage`) and deployable models for a live harness (`runtime`; `--seeds 3` for the seed-averaged models) |
 | `runtime.py` | Run-time interface: predictions, cost-aware stopping, estimate and interval, under either design (`standard` or `balanced`) |
 | `demo_runtime.py` | Replays a held-out agent's logged runs through `runtime.py` as a live harness would, under both designs (`--ensemble 3` for the seed-averaged models) |
+| `tool_ab_check.py` | Rishi's tool A/B runs (Qwen, 4 arms × 100 tasks) with the runtime's predictions, as trained and calibrated: prediction quality, each arm alone, controls, and each tool change against the baseline |
 
 ## Learned remaining cost: a trained component that beats the hand-made policies
 
