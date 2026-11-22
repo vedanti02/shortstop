@@ -1,0 +1,4 @@
+arm,n_tasks,base_rate,arm_rate,diff,ci_low,ci_high,arm_better,base_better,p_value,base_tokens,arm_tokens,token_ratio,verdict
+qwen-descriptions,100,0.4,0.26,-0.14,-0.23,-0.05,5,19,0.006610751152038574,696171.26,885173.06,1.2714875072550396,worse
+qwen-search,100,0.4,0.34,-0.06,-0.14,0.02,6,12,0.237884521484375,696171.26,777918.93,1.1174246549620563,no detectable difference
+qwen-compressed,100,0.4,0.32,-0.08,-0.15,-0.01,3,11,0.057373046875,696171.26,650881.21,0.9349440969453406,worse
