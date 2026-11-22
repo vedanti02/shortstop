@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# search: find code in the repository without flooding the context.
+#
+#   search PATTERN [PATH]       lines matching PATTERN (extended regex), grouped by file
+#   search -i PATTERN [PATH]    same, ignoring case
+#   search -f NAME [PATH]       files whose path contains NAME
+#
+# PATH may be a directory or a single file. Skips .git, caches and binary files. Results are
+# sorted by file and line; at most 50 matching lines and 30 files are shown.
+set -u
+
+MAX_LINES=50
+MAX_FILES=30
+MAX_LINE_CHARS=200
+SKIP_DIRS=(.git __pycache__ node_modules .tox .mypy_cache .pytest_cache)
+
+usage() {
+    echo "usage: search [-i] PATTERN [PATH] | search -f NAME [PATH]"
+    exit 2
+}
+
+plural() {  # plural COUNT WORD -> "1 file" / "3 files"
+    if [ "$1" = "1" ]; then echo "$1 $2"; else echo "$1 ${2}s"; fi
+}
+
+mode="content"
+case_flag=""
+case "${1:-}" in
+    -f) mode="files"; shift ;;
+    -i) case_flag="-i"; shift ;;
+    -h|--help|"") usage ;;
+esac
+[ $# -ge 1 ] || usage
+pattern="$1"
+root="${2:-.}"
+
+if [ ! -e "$root" ]; then
+    echo "search: error: path '$root' does not exist"
+    exit 2
+fi
+
+if [ "$mode" = "files" ]; then
+    prune=()
+    for d in "${SKIP_DIRS[@]}"; do
+        prune+=(-name "$d" -o)
+    done
+    unset 'prune[${#prune[@]}-1]'
+    matches=$(find "$root" \( "${prune[@]}" \) -prune -o -type f -print 2>/dev/null \
+              | grep -F -- "$pattern" | sed 's|^\./||' | LC_ALL=C sort)
+    if [ -z "$matches" ]; then
+        echo "No files matching '$pattern' under $root"
+        exit 1
+    fi
+    total=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
+    echo "$(plural "$total" file) matching '$pattern' (showing up to $MAX_FILES):"
+    printf '%s\n' "$matches" | head -n "$MAX_FILES"
+    exit 0
+fi
+
+excludes=()
+for d in "${SKIP_DIRS[@]}"; do
+    excludes+=(--exclude-dir="$d")
+done
+errors=$(mktemp)
+trap 'rm -f "$errors"' EXIT
+
+# grep -H keeps the file name even when PATH is a single file. Each hit becomes
+# "file<TAB>line<TAB>text", split at the first ":<digits>:", then sorted by file and line.
+raw=$(grep -rnHIE $case_flag "${excludes[@]}" -- "$pattern" "$root" 2>"$errors")
+status=$?
+if [ "$status" -eq 2 ] && [ -z "$raw" ]; then
+    echo "search: error: $(head -n 3 "$errors")"
+    exit 2
+fi
+if [ -z "$raw" ]; then
+    echo "No matches for '$pattern' under $root"
+    exit 1
+fi
+results=$(printf '%s\n' "$raw" | awk '
+    match($0, /:[0-9]+:/) {
+        file = substr($0, 1, RSTART - 1)
+        sub(/^\.\//, "", file)
+        line = substr($0, RSTART + 1, RLENGTH - 2)
+        printf "%s\t%s\t%s\n", file, line, substr($0, RSTART + RLENGTH)
+    }' | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2n)
+
+total=$(printf '%s\n' "$results" | wc -l | tr -d ' ')
+nfiles=$(printf '%s\n' "$results" | cut -f1 | sort -u | wc -l | tr -d ' ')
+echo "$(plural "$total" match | sed 's/matchs$/matches/') in $(plural "$nfiles" file) (showing up to $MAX_LINES lines):"
+printf '%s\n' "$results" | head -n "$MAX_LINES" | awk -F '\t' -v max="$MAX_LINE_CHARS" '
+    {
+        text = substr($0, length($1) + length($2) + 3)
+        if (length(text) > max) text = substr(text, 1, max) " ..."
+        if ($1 != current) { print ""; print $1; current = $1 }
+        printf "  %s: %s\n", $2, text
+    }'
+if [ "$total" -gt "$MAX_LINES" ]; then
+    echo ""
+    echo "[$((total - MAX_LINES)) more matches not shown; narrow the pattern or PATH]"
+fi
+if [ "$status" -eq 2 ]; then
+    echo "[some files could not be read: $(head -n 1 "$errors")]"
+fi

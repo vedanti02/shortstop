@@ -1,0 +1,22 @@
+# Tool change 1: better tool descriptions.
+#
+# Only the bash tool's schema descriptions change. The prompt, the environment and the
+# output handling are identical to the baseline. Every fact stated here matches base.yaml
+# (60 s timeout, 10,000-character output cut, fresh subshell per call, /testbed).
+model:
+  tool_description: >-
+    Run one bash command in a fresh, non-interactive subshell inside the repository sandbox
+    (working directory /testbed) and return its exit code and combined stdout and stderr.
+    Each call starts a new shell, so `cd` and exported variables do not carry over to the
+    next call: chain them in one command, e.g. `cd /testbed/src && python -m pytest -q
+    tests/test_x.py`. Commands are killed after 60 seconds, so do not start servers,
+    watchers or interactive programs (vim, less, a bare python REPL). If an output is longer
+    than 10,000 characters only its first and last 5,000 characters are shown, so read files
+    in slices (`sed -n '120,180p' path.py` or `nl -ba path.py | sed -n '120,180p'`) and
+    narrow searches (`grep -rn "def name" --include='*.py' pkg/ | head -30`). Edit files
+    with `sed -i`, a heredoc (`cat <<'EOF' > path`) or a short Python script, then re-read
+    the edited lines to confirm the change. Independent commands can be sent as several
+    calls in one response.
+  command_description: >-
+    A single non-interactive bash command or pipeline, for example
+    `grep -rn "class QuerySet" --include='*.py' django/db | head -20`.

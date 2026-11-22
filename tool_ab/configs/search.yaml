@@ -1,0 +1,17 @@
+# Tool change 2: a dedicated search tool.
+#
+# Installs `search` (tool_ab/shortstop_plugin/scripts/search) in the sandbox before the
+# first step and documents it in the prompt through the extra_instructions hook. It is a
+# bash command rather than a second function-calling tool, so parsing is unchanged.
+agent:
+  setup_scripts: [search]
+  extra_instructions: |-
+    ## Search Tool
+
+    A `search` command is installed for locating code:
+
+    - `search PATTERN [PATH]` lists lines matching PATTERN (extended regex), grouped by file with line numbers
+    - `search -i PATTERN [PATH]` does the same, ignoring case
+    - `search -f NAME [PATH]` lists files whose path contains NAME
+
+    It skips .git, caches and binary files and shows at most 50 lines, so prefer it over `grep -r` and `find` when looking for where something is defined or used.
