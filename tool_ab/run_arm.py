@@ -6,8 +6,13 @@
 This is `mini-extra swebench` with three differences. The agent is the plug-in
 (StoppingAgent; mini-swe-agent's batch runner ignores `agent_class`, so its agent is
 swapped here). `swerex_modal` runs commands in bash with the image's conda environment
-(see shortstop_plugin/environment.py). The config is configs/base.yaml plus the arm's overlay. Tasks come from
+(see shortstop_plugin/environment.py). The config is configs/base.yaml plus the arm's
+overlay, with `agent.agent_name` set to qwen-<arm> as in the converted data. Tasks come from
 configs/tasks.txt in a fixed order, so `--slice 0:20` is the same 20 tasks for every arm.
+
+The predictor and stop policy are loaded once before any sandbox starts, so a predictor that
+fails to load stops the run at once. If the predictor or policy fails during a run, no new
+tasks start and the script exits with an error; fix it, then rerun with --retry-errors.
 
 Outputs go to data/tool_ab/runs/<arm>/: one <task>/<task>.traj.json per run and preds.json
 for evaluation. Finished tasks are skipped on a rerun unless --redo-existing is given;
@@ -20,6 +25,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 from pathlib import Path
 
 TOOL_AB = Path(__file__).resolve().parent
@@ -36,7 +42,8 @@ ARMS: dict[str, list[str]] = {
 def config_specs(arm: str, overrides: tuple[str, ...] = ()) -> list[str]:
     if arm not in ARMS:
         raise ValueError(f"Unknown arm {arm!r}; choose from {sorted(ARMS)}")
-    return [str(CONFIGS / "base.yaml"), *(str(CONFIGS / f) for f in ARMS[arm]), *overrides]
+    return [str(CONFIGS / "base.yaml"), *(str(CONFIGS / f) for f in ARMS[arm]),
+            f"agent.agent_name=qwen-{arm}", *overrides]
 
 
 def arm_config(arm: str, overrides: tuple[str, ...] = ()) -> dict:
@@ -65,15 +72,14 @@ def filter_regex(task_ids: list[str]) -> str:
 
 def forget_errored_runs(output_dir: Path) -> list[str]:
     """Drop tasks that ended in an infrastructure error from preds.json so they run again."""
-    from shortstop_plugin.status import is_infra_error, tasks_without_trajectory
+    from shortstop_plugin.status import infra_error_of, tasks_without_trajectory
 
     preds_path = Path(output_dir) / "preds.json"
     if not preds_path.exists():
         return []
     errored = tasks_without_trajectory(output_dir)
     for traj_path in sorted(Path(output_dir).glob("*/*.traj.json")):
-        info = json.loads(traj_path.read_text()).get("info") or {}
-        if is_infra_error(info.get("exit_status")):
+        if infra_error_of(json.loads(traj_path.read_text())) is not None:
             errored.append(traj_path.parent.name)
     preds = json.loads(preds_path.read_text())
     kept = {task: pred for task, pred in preds.items() if task not in errored}
@@ -81,13 +87,42 @@ def forget_errored_runs(output_dir: Path) -> list[str]:
     return errored
 
 
-def make_progress_agent() -> type:
-    """StoppingAgent with the progress reporting the batch runner expects; stops its environment."""
-    from shortstop_plugin.agent import StoppingAgent
+class RunAborted(RuntimeError):
+    """A task was skipped because an earlier one hit a predictor error."""
+
+
+def preload_stop_components(config: dict) -> None:
+    """Build the predictor and stop policy before any sandbox starts.
+
+    Agents get the same shared objects afterwards (policies.load_shared), so a predictor that
+    fails to load stops the run here instead of failing once per task with a live sandbox.
+    """
+    from shortstop_plugin.agent import StoppingAgentConfig
+    from shortstop_plugin.policies import load_shared
+
+    agent = StoppingAgentConfig(**{k: v for k, v in config.get("agent", {}).items()
+                                   if k in StoppingAgentConfig.model_fields})
+    load_shared(agent.stop_policy, agent.stop_policy_kwargs)
+    load_shared(agent.predictor, agent.predictor_kwargs)
+
+
+def make_progress_agent(abort: threading.Event | None = None) -> type:
+    """StoppingAgent with the progress reporting the batch runner expects.
+
+    It stops its environment, also when the agent cannot be built, and sets `abort` on a
+    predictor error so the remaining tasks are skipped.
+    """
+    from shortstop_plugin.agent import PredictorError, StoppingAgent
+
+    abort = abort or threading.Event()
 
     class ProgressStoppingAgent(StoppingAgent):
-        def __init__(self, *args, progress_manager, instance_id: str = "", **kwargs):
-            super().__init__(*args, instance_id=instance_id, **kwargs)
+        def __init__(self, model, env, *, progress_manager, instance_id: str = "", **kwargs):
+            try:
+                super().__init__(model, env, instance_id=instance_id, **kwargs)
+            except Exception:
+                _stop_env(env)  # the sandbox already exists and nothing else would stop it
+                raise
             self.progress_manager = progress_manager
 
         def step(self) -> list[dict]:
@@ -97,13 +132,37 @@ def make_progress_agent() -> type:
         def run(self, *args, **kwargs) -> dict:
             # The batch runner never stops environments, so each Modal sandbox would outlive its run.
             try:
+                if abort.is_set():
+                    raise RunAborted("skipped: an earlier task hit a predictor error")
                 return super().run(*args, **kwargs)
+            except PredictorError:
+                abort.set()
+                raise
             finally:
-                stop = getattr(self.env, "stop", None)
-                if stop is not None:
-                    stop()
+                _stop_env(self.env)
 
     return ProgressStoppingAgent
+
+
+def _stop_env(env) -> None:
+    """Stop the environment without masking the exception that ended the run."""
+    stop = getattr(env, "stop", None)
+    if stop is None:
+        return
+    try:
+        stop()
+    except Exception as e:  # noqa: BLE001 -- the sandbox's own timeout still ends it
+        print(f"warning: stopping the environment failed: {e!r}", file=sys.stderr)
+
+
+def guard_environment_start(start, abort: threading.Event):
+    """Wrap the runner's sandbox factory so no new sandbox starts once the run is aborted."""
+    def guarded(*args, **kwargs):
+        if abort.is_set():
+            raise RunAborted("skipped: an earlier task hit a predictor error")
+        return start(*args, **kwargs)
+
+    return guarded
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -136,9 +195,13 @@ def main(argv: list[str] | None = None) -> None:
     if not tasks:
         raise SystemExit("No tasks selected")
     output = args.output or REPO / "data" / "tool_ab" / "runs" / args.arm
+    specs = config_specs(args.arm, tuple(args.config))
+    preload_stop_components(arm_config(args.arm, tuple(args.config)))
     if args.retry_errors:
         print(f"retrying {len(forget_errored_runs(output))} errored tasks")
-    swebench.ProgressTrackingAgent = make_progress_agent()
+    abort = threading.Event()
+    swebench.ProgressTrackingAgent = make_progress_agent(abort)
+    swebench.get_sb_environment = guard_environment_start(swebench.get_sb_environment, abort)
     environment.register()
     swebench.main(
         subset="verified",
@@ -151,9 +214,12 @@ def main(argv: list[str] | None = None) -> None:
         model=None,
         model_class=None,
         redo_existing=args.redo_existing,
-        config_spec=config_specs(args.arm, tuple(args.config)),
+        config_spec=specs,
         environment_class=None,
     )
+    if abort.is_set():
+        raise SystemExit("Stopped: the predictor or stop policy failed (PredictorError in the "
+                         "trajectories). Fix it, then rerun with --retry-errors.")
 
 
 if __name__ == "__main__":

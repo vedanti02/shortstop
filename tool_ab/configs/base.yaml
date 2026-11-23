@@ -124,7 +124,8 @@ agent:
   cost_limit: 0  # disabled: a self-hosted model has no price; step_limit bounds compute
   wall_time_limit_seconds: 0  # off: run speed depends on server load, not on the tool change
   seed: 0
-  agent_name: qwen3-coder-30b
+  agent_name: qwen-baseline  # run_arm.py sets qwen-<arm>, the agent name in the converted JSONL
+  save_diffs: true  # git diff after each step, under info.step_diffs, for offline mid-run probes
 
 environment:
   environment_class: swerex_modal
@@ -138,8 +139,8 @@ environment:
     TQDM_DISABLE: "1"
     BASH_ENV: /root/.bashrc
   startup_timeout: 600.0  # the first run of each task image builds it on Modal
-  runtime_timeout: 7200.0  # backstop only; a run that hits it is an infrastructure error
-  deployment_timeout: 7200.0
+  runtime_timeout: 7200.0  # HTTP timeout of each call to the sandbox runtime
+  deployment_timeout: 7200.0  # sandbox lifetime: backstop only; a run that hits it is an infrastructure error
   install_pipx: true
 
 model:

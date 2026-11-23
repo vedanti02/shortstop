@@ -38,3 +38,20 @@ def test_load_factory_resolves_dotted_paths():
     assert policy([], (0.5,)) == 0.7
     predictor = load_factory("shortstop.predictor.constant_predictor", {"p": 0.2})
     assert predictor([]) == 0.2
+
+
+def test_a_factory_may_load_another_shared_component(monkeypatch):
+    import sys
+    import types
+
+    from shortstop_plugin.policies import load_shared
+
+    module = types.ModuleType("nested_factory_mod")
+
+    def outer():
+        inner = load_shared("shortstop_plugin.policies.constant", {"p": 0.4})
+        return lambda prefix, predictions: inner(prefix, predictions)
+
+    module.outer = outer
+    monkeypatch.setitem(sys.modules, "nested_factory_mod", module)
+    assert load_shared("nested_factory_mod.outer")([], [0.5]) == 0.4  # no deadlock

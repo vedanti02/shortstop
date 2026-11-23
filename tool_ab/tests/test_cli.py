@@ -34,6 +34,7 @@ def test_run_arm_main_swaps_in_the_plugin_and_passes_the_task_filter(tmp_path, m
     calls = {}
     monkeypatch.setattr(swebench, "main", lambda **kw: calls.update(kw))
     monkeypatch.setattr(swebench, "ProgressTrackingAgent", swebench.ProgressTrackingAgent)
+    monkeypatch.setattr(swebench, "get_sb_environment", swebench.get_sb_environment)
     task_file = tmp_path / "tasks.txt"
     task_file.write_text("a__a-1\nb__b-2\nc__c-3\n")
     run_arm.main(["--arm", "search", "--tasks", str(task_file), "--slice", "0:2",
@@ -42,7 +43,8 @@ def test_run_arm_main_swaps_in_the_plugin_and_passes_the_task_filter(tmp_path, m
     assert issubclass(swebench.ProgressTrackingAgent, StoppingAgent)
     assert environments.get_environment_class("swerex_modal") is BashModalEnvironment
     assert re.match(calls["filter_spec"], "b__b-2") and not re.match(calls["filter_spec"], "c__c-3")
-    assert calls["config_spec"][-2].endswith("search.yaml")
+    assert calls["config_spec"][-3].endswith("search.yaml")
+    assert calls["config_spec"][-2] == "agent.agent_name=qwen-search"
     assert calls["config_spec"][-1] == "agent.step_limit=5"
     assert calls["subset"] == "verified" and calls["split"] == "test"
 
@@ -177,3 +179,110 @@ def test_retry_errors_also_catches_runs_whose_sandbox_never_started(tmp_path):
     (out / "preds.json").write_text(json.dumps({"lost": {"instance_id": "lost", "model_patch": ""}}))
     assert run_arm.forget_errored_runs(out) == ["lost"]
     assert json.loads((out / "preds.json").read_text()) == {}
+
+
+class StoppableLocal:
+    """A LocalEnvironment that counts stop() calls (built lazily so the import stays local)."""
+
+    @staticmethod
+    def make(tmp_path):
+        from minisweagent.environments.local import LocalEnvironment
+
+        class Env(LocalEnvironment):
+            stopped = 0
+
+            def stop(self):
+                self.stopped += 1
+
+        return Env(cwd=str(tmp_path))
+
+
+class QuietProgress:
+    def update_instance_status(self, instance_id, status):
+        pass
+
+
+def test_a_predictor_error_aborts_the_remaining_tasks(tmp_path):
+    import threading
+
+    from minisweagent.models.test_models import DeterministicModel
+    from shortstop_plugin.agent import PredictorError
+
+    abort = threading.Event()
+    agent_class = run_arm.make_progress_agent(abort)
+    common = {"progress_manager": QuietProgress(), "system_template": "s", "instance_template": "{{task}}"}
+    first_env = StoppableLocal.make(tmp_path)
+    first = agent_class(DeterministicModel(outputs=[]), first_env, instance_id="t1", **common)
+    first._policy = lambda prefix, predictions: 5.0
+    with pytest.raises(PredictorError):
+        first.run("x")
+    assert abort.is_set() and first_env.stopped == 1
+
+    second_env = StoppableLocal.make(tmp_path)
+    second = agent_class(DeterministicModel(outputs=[]), second_env, instance_id="t2", **common)
+    with pytest.raises(run_arm.RunAborted):
+        second.run("x")
+    assert second_env.stopped == 1
+    start = run_arm.guard_environment_start(lambda *a: pytest.fail("no new sandbox"), abort)
+    with pytest.raises(run_arm.RunAborted):
+        start({}, {})
+
+
+def test_the_sandbox_is_stopped_when_the_agent_cannot_be_built(tmp_path):
+    from minisweagent.models.test_models import DeterministicModel
+
+    env = StoppableLocal.make(tmp_path)
+    with pytest.raises(ModuleNotFoundError):
+        run_arm.make_progress_agent()(
+            DeterministicModel(outputs=[]), env, progress_manager=QuietProgress(), instance_id="t1",
+            system_template="s", instance_template="{{task}}", predictor="no_such_module.predictor",
+        )
+    assert env.stopped == 1
+
+
+def test_a_predictor_that_fails_to_load_stops_the_run_before_any_sandbox(tmp_path, monkeypatch):
+    from minisweagent.run.benchmarks import swebench
+
+    monkeypatch.setattr(swebench, "main", lambda **kw: pytest.fail("no task should start"))
+    monkeypatch.setattr(swebench, "ProgressTrackingAgent", swebench.ProgressTrackingAgent)
+    monkeypatch.setattr(swebench, "get_sb_environment", swebench.get_sb_environment)
+    task_file = tmp_path / "tasks.txt"
+    task_file.write_text("a__a-1\n")
+    with pytest.raises(ModuleNotFoundError):
+        run_arm.main(["--arm", "baseline", "--tasks", str(task_file), "-o", str(tmp_path / "out"),
+                      "-c", "agent.predictor=no_such_module.predictor"])
+
+
+def test_run_arm_main_exits_with_an_error_after_a_predictor_failure(tmp_path, monkeypatch):
+    from minisweagent.models.test_models import DeterministicModel
+    from minisweagent.run.benchmarks import swebench
+    from shortstop_plugin.agent import PredictorError
+
+    def fake_main(**kw):
+        agent_class = swebench.ProgressTrackingAgent
+        env = StoppableLocal.make(tmp_path)
+
+        agent = agent_class(DeterministicModel(outputs=[]), env, progress_manager=QuietProgress(),
+                            instance_id="t1", system_template="s", instance_template="{{task}}")
+        agent._predictor = lambda prefix: -1.0
+        with pytest.raises(PredictorError):
+            agent.run("x")
+
+    monkeypatch.setattr(swebench, "main", fake_main)
+    monkeypatch.setattr(swebench, "ProgressTrackingAgent", swebench.ProgressTrackingAgent)
+    monkeypatch.setattr(swebench, "get_sb_environment", swebench.get_sb_environment)
+    task_file = tmp_path / "tasks.txt"
+    task_file.write_text("a__a-1\n")
+    with pytest.raises(SystemExit, match="predictor or stop policy failed"):
+        run_arm.main(["--arm", "baseline", "--tasks", str(task_file), "-o", str(tmp_path / "out")])
+
+
+def test_retry_errors_reruns_runs_that_lost_their_sandbox_connection(tmp_path):
+    out = tmp_path / "out"
+    path = out / "t" / "t.traj.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"instance_id": "t", "info": {"exit_status": "Submitted"}, "messages": [
+        {"role": "tool", "content": "Cannot connect to host", "extra": {"exception_type": "ClientConnectorError"}},
+    ]}))
+    (out / "preds.json").write_text(json.dumps({"t": {"instance_id": "t", "model_patch": "x"}}))
+    assert run_arm.forget_errored_runs(out) == ["t"]

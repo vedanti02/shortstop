@@ -40,7 +40,8 @@ def test_baseline_prompt_is_the_upstream_prompt():
 def test_each_arm_changes_only_its_own_settings(arm, expected):
     base, treated = flatten(arm_config("baseline")), flatten(arm_config(arm))
     changed = {k for k in base.keys() | treated.keys() if base.get(k) != treated.get(k)}
-    assert changed == expected
+    assert changed - {"agent.agent_name"} == expected  # the name is a label, not a setting
+    assert treated["agent.agent_name"] == f"qwen-{arm}" and base["agent.agent_name"] == "qwen-baseline"
 
 
 @pytest.mark.parametrize("arm", list(ARMS))

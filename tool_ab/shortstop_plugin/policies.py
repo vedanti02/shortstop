@@ -33,7 +33,7 @@ def load_factory(dotted_path: str, kwargs: dict[str, Any] | None = None) -> Call
 
 
 _SHARED: dict[str, Callable] = {}
-_SHARED_LOCK = threading.Lock()
+_SHARED_LOCK = threading.RLock()  # reentrant: a factory may call load_shared itself
 
 
 def load_shared(dotted_path: str, kwargs: dict[str, Any] | None = None) -> Callable:
