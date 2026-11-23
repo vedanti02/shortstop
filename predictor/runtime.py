@@ -18,19 +18,26 @@ run.finish(outcome) without observe(). The attempted step then counts as the one
 the outcome; overwriting the last prediction instead would bias the estimate. result() refuses a
 batch in which a started run was neither stopped nor finished.
 
-Two interchangeable designs. They share the predictor, the cost model and the stopping policy,
+Three interchangeable designs. They share the predictor, the cost model and the stopping policy,
 and differ only in how each run's stopping uniform is drawn and which interval is reported:
 
     rt.plan(task_ids, design="standard")    the default
         Independent uniforms, and Vedanti's interval mean +/- 1.96 sd / sqrt(n)
         (coverage/experiments.py). Proven: coverage/THEORY.md, Theorem 2a.
     rt.plan(task_ids, design="balanced")
-        Uniforms spread evenly within strata of runs with similar step-1 reach probability, and
-        the design-based interval of predictor/balanced.py. A narrower interval for the same
-        tokens; validated by simulation on two benchmarks, but not yet proven.
+        Uniforms dealt evenly within strata of runs with similar step-1 reach probability, every
+        run of a stratum with the same chance to start (a whole number of 1/N slices), and the
+        interval of balanced.proven_variance, which adds each started run's own estimate of the
+        noise from its later steps. A narrower interval for the same tokens. Proven in
+        predictor/THEORY_BALANCED.md, Theorem B4 (draft, to be checked by a second reader).
+    rt.plan(task_ids, design="balanced-unproven")
+        The earlier balanced design, kept for comparison: every run keeps its own step-1 reach
+        probability, and the interval is balanced.design_variance with the finite-population
+        correction. Not proven, and slightly too narrow in general: the correction also shrinks
+        the noise from the started runs' later steps (THEORY_BALANCED.md, Section 4).
 
-Either way every run's estimate is exactly unbiased (coverage/THEORY.md, Lemma 1), so the
-score is unbiased under both designs; only the interval differs.
+Every run's estimate is exactly unbiased under all three (coverage/THEORY.md, Lemma 1), so the
+score is unbiased under each; only the interval differs.
 
 Either design runs with either set of models: `export.py runtime` saves one success model
 (data/predictor/runtime/all), `export.py runtime --seeds 3` saves three trained with different
@@ -79,7 +86,13 @@ from scipy.stats import t as student_t
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(REPO / "src"))
-from balanced import design_variance, stratified_uniforms
+from balanced import (
+    design_variance,
+    equal_chance_uniforms,
+    omega_hat,
+    proven_variance,
+    stratified_uniforms,
+)
 from step_features import RunFeatures, gold_info
 
 from shortstop import rr_estimate
@@ -180,8 +193,9 @@ class Runtime:
         return float(np.clip(k * np.sqrt(f * (1 - f) / max(r_rel, 1e-6)), floor, 1.0))
 
     def plan(self, task_ids: list[str], seed: int = 0, design: str = "standard") -> Plan:
-        """Plan a batch: design "standard" (independent stopping, proven interval) or "balanced"
-        (balanced stopping, design-based interval, not yet proven). See the module docstring."""
+        """Plan a batch: design "standard" (independent stopping, proven interval), "balanced"
+        (balanced stopping with equal chances, proven in THEORY_BALANCED.md) or
+        "balanced-unproven" (the earlier balanced design). See the module docstring."""
         if design not in DESIGNS:
             raise ValueError(f"design must be one of {sorted(DESIGNS)}, not {design!r}")
         return DESIGNS[design](self, task_ids, np.random.default_rng(seed))
@@ -315,11 +329,42 @@ class StandardPlan(Plan):
 
 
 class BalancedPlan(Plan):
-    """Stopping uniforms spread evenly within strata of meta["block"] runs sorted by (P_1, f0),
-    and the design-based interval of predictor/balanced.py (validated by simulation on two
-    benchmarks; not yet proven)."""
+    """Equal-chance strata: runs sorted by (P_1, f0) in strata of meta["block"] (the last one also
+    takes the remainder), every run of a stratum with the same step-1 reach probability m / N and
+    stopping uniforms dealt one per slice, so exactly m runs start. Interval: balanced.proven_variance,
+    with each started run's own estimate of its later-step noise (predictor/THEORY_BALANCED.md,
+    Theorem B4)."""
 
     design = "balanced"
+
+    def uniforms(self, rng) -> np.ndarray:
+        if len(self.task_ids) < 2:
+            raise ValueError("the balanced designs need at least 2 tasks")
+        p1 = np.array([self.p1[t] for t in self.task_ids])[None, :]
+        f0 = np.array([self.step0[t][0] for t in self.task_ids])[None, :]
+        u, strata, p_common = equal_chance_uniforms(p1, f0, self.rt.meta["block"], rng, self.rt.meta["floor"])
+        self.stratum = dict(zip(self.task_ids, strata[0]))
+        # every run of a stratum gets the same chance to start; later steps are capped at it,
+        # because each reach probability is at most the one before
+        self.p1 = dict(zip(self.task_ids, p_common[0].tolist()))
+        return u[0]
+
+    def half_width(self, ids: list[str], runs: list[Run], est: np.ndarray) -> float:
+        def row(values) -> np.ndarray:
+            return np.asarray(values)[None, :]
+        var, df = proven_variance(row(est), row([r.f[0] for r in runs]), row([len(r.reach) > 0 for r in runs]),
+                                  row([self.stratum[t] for t in ids]), row([omega_hat(r.f, r.reach) for r in runs]),
+                                  len(runs))
+        return float(student_t.ppf(0.975, df[0]) * np.sqrt(var[0]))
+
+
+class UnprovenBalancedPlan(Plan):
+    """The earlier balanced design, kept for comparison: stopping uniforms spread evenly within
+    strata of meta["block"] runs sorted by (P_1, f0), each run keeping its own P_1, and the
+    design-based interval of balanced.design_variance with the finite-population correction.
+    Not proven: that interval is slightly too narrow in general (THEORY_BALANCED.md, Section 4)."""
+
+    design = "balanced-unproven"
 
     def uniforms(self, rng) -> np.ndarray:
         p1 = np.array([self.p1[t] for t in self.task_ids])[None, :]
@@ -337,4 +382,4 @@ class BalancedPlan(Plan):
         return float(student_t.ppf(0.975, df[0]) * np.sqrt(var[0]))
 
 
-DESIGNS = {"standard": StandardPlan, "balanced": BalancedPlan}
+DESIGNS = {"standard": StandardPlan, "balanced": BalancedPlan, "balanced-unproven": UnprovenBalancedPlan}

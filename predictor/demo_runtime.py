@@ -1,8 +1,8 @@
 """End-to-end check of the run-time interface on real logged runs of an agent it never saw.
 
     python predictor/export.py runtime --exclude <agent>    # once: models without that agent
-    python predictor/demo_runtime.py <agent> --seeds 20                     # both designs
-    python predictor/demo_runtime.py <agent> --design standard              # or balanced
+    python predictor/demo_runtime.py <agent> --seeds 20                     # standard and balanced
+    python predictor/demo_runtime.py <agent> --design standard              # or balanced, balanced-unproven, all
     python predictor/demo_runtime.py <agent> --ensemble 3  # the seed-averaged models (export --seeds 3)
 
 Replays the agent's logged SWE-bench Verified runs through predictor/runtime.py exactly as a live
@@ -22,12 +22,13 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from runtime import Runtime
+from runtime import DESIGNS, Runtime
 
 from shortstop import load_trajectories
 
-LABEL = {"standard": "independent stopping, mean +/- 1.96 sd / sqrt(n) (proven)",
-         "balanced": "balanced stopping, design-based interval (not yet proven)"}
+LABEL = {"standard": "independent stopping, mean +/- 1.96 sd / sqrt(n) (proven, Theorem 2a)",
+         "balanced": "balanced stopping, equal chances, interval with later steps (proven, Theorem B4)",
+         "balanced-unproven": "balanced stopping, design-based interval (earlier design, not proven)"}
 
 
 def evaluate_once(rt: Runtime, runs: dict, seed: int, design: str) -> dict:
@@ -64,7 +65,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("agent")
     parser.add_argument("--seeds", type=int, default=20)
-    parser.add_argument("--design", choices=["standard", "balanced", "both"], default="both")
+    parser.add_argument("--design", choices=[*DESIGNS, "both", "all"], default="both",
+                        help="both: standard and balanced; all: every design")
     parser.add_argument("--ensemble", type=int, default=1,
                         help="use the models averaged over this many seeds (export.py runtime --seeds N)")
     args = parser.parse_args()
@@ -83,7 +85,8 @@ def main() -> None:
     full_half = 1.96 * np.sqrt(truth * (1 - truth) / len(runs))
     print(f"{args.agent}: {len(runs)} tasks, true resolve rate {truth:.3f}, "
           f"half-width with full runs {full_half:.3f}, {len(rt.success_models)} success model(s)")
-    for design in ["standard", "balanced"] if args.design == "both" else [args.design]:
+    chosen = {"both": ["standard", "balanced"], "all": list(DESIGNS)}.get(args.design, [args.design])
+    for design in chosen:
         report(design, [evaluate_once(rt, runs, seed, design) for seed in range(args.seeds)],
                truth, full_tokens, full_half)
 
