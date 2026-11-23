@@ -28,17 +28,24 @@ Tool A/B agent runs and the mini-swe-agent plug-in.
 ## Results
 
 Full run, 2026-11-21: the first 100 tasks of `configs/tasks.txt`, Qwen3-Coder-30B-A3B (FP8), all
-four arms, no infrastructure errors left after one retry, every patch scored.
+four arms, every patch scored. 10 of the 400 runs lost their sandbox connection partway
+("Cannot connect to host", "Connection reset by peer"; 1 baseline, 2 descriptions, 4 search,
+3 compressed). The run code at the time showed those failures to the agent instead of ending
+the run, so they are now classed as infrastructure errors and left out until rerun; each
+comparison uses the tasks both arms have.
 
-| Change | Baseline | With change | Difference (95% CI) | Wins / losses | McNemar p | Tokens | Verdict |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| descriptions | 40% | 26% | -14 (-23 to -5) | 5 / 19 | 0.007 | 1.27x | worse |
-| search | 40% | 34% | -6 (-14 to +2) | 6 / 12 | 0.238 | 1.12x | no detectable difference |
-| compressed | 40% | 32% | -8 (-15 to -1) | 3 / 11 | 0.057 | 0.93x | worse by the CI, borderline by McNemar |
+| Change | Tasks | Baseline | With change | Difference (95% CI) | Wins / losses | McNemar p | Tokens | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| descriptions | 97 | 40.2% | 26.8% | -13.4 (-22.7 to -4.1) | 5 / 18 | 0.011 | 1.25x | worse |
+| search | 95 | 41.1% | 35.8% | -5.3 (-13.7 to +3.2) | 6 / 11 | 0.332 | 1.15x | no detectable difference |
+| compressed | 96 | 39.6% | 31.2% | -8.3 (-15.6 to -1.0) | 3 / 11 | 0.057 | 0.92x | borderline worse |
 
-None of the three tool changes helps this model; longer tool descriptions clearly hurt it.
-The whole run cost about $44 of Modal compute (about 15 h; the GPU server is two thirds of it).
-Trajectories in the shared format (`qwen-*.jsonl`) stay out of git, like all run data.
+A verdict is firm when the bootstrap interval excludes zero and McNemar p < 0.05, and
+borderline when only one of them does. None of the three tool changes helps this model;
+longer tool descriptions clearly hurt it. Tokens include failed model calls (see
+`shortstop_plugin/steps.py`). The whole run cost about $44 of Modal compute (about 15 h; the
+GPU server is two thirds of it). Trajectories in the shared format (`qwen-*.jsonl`) stay out
+of git, like all run data.
 
 ## The three tool changes
 
@@ -50,16 +57,18 @@ thing; `tests/test_configs.py` checks that no other setting differs from the bas
 | `baseline` | mini-swe-agent's SWE-bench prompt and bash tool, unchanged | `base.yaml` |
 | `descriptions` | Detailed bash tool description: subshell semantics, timeout, output limits, how to view and edit files | `descriptions.yaml`, `shortstop_plugin/model.py` |
 | `search` | A `search` command installed in the sandbox (grouped, capped matches; file-name search), documented in the prompt | `search.yaml`, `shortstop_plugin/scripts/search` |
-| `compressed` | Outputs cleaned (ANSI, progress bars, repeated lines) and cut to 4,000 characters, head and tail kept | `compressed.yaml`, `shortstop_plugin/compress.py` |
+| `compressed` | Every output rewritten, short ones too: ANSI codes stripped, progress bars kept at their final state, CRLF endings dropped, lines over 300 characters cut, runs of blank lines collapsed, repeated lines replaced with a marker; then anything still over 4,000 characters keeps its head and tail | `compressed.yaml`, `shortstop_plugin/compress.py` |
 
 One baseline arm serves all three comparisons, so the experiment is 4 arms, not 6.
 
 ## The plug-in
 
 `shortstop_plugin.agent.StoppingAgent` is a mini-swe-agent agent. Before step k it calls the
-predictor on the steps so far to get f_{k-1}, calls the stop policy to get p_k, and runs step k
-with probability p_k. Each step gets exactly one draw, even if the model's reply fails to parse
-and is retried. Policies and predictors are named by dotted path in the config:
+predictor on the steps so far to get f_{k-1} and the stop policy to get p_k. It draws one
+uniform number u per task and runs step k while u < p_1 * ... * p_k, so each step still runs
+with probability p_k given the earlier ones, and arms with the same seed stop at matching
+points as often as possible. Each step is decided once, even if the model's reply fails to
+parse and is retried. Policies and predictors are named by dotted path in the config:
 
 ```yaml
 agent:
@@ -71,15 +80,35 @@ agent:
 ```
 
 Each trajectory saves `info.shortstop` with `predictions` (f_0, f_1, ...), `continue_probs`
-(p_1, p_2, ...), `steps_run` (s) and `stopped_early`. That is everything `rr_estimate(f, p, s)`
-needs; for a full run, f_T is the evaluated outcome. A policy gets `(prefix, predictions)` and
-returns p_k in (0, 1]; anything else stops the run with an error.
+(p_1, p_2, ...), `s`, `steps_run`, `stopped_early`, and the seed, agent name, policy and
+predictor settings. For `rr_estimate(f, p, s)`:
 
+```python
+s = rec["s"]                                   # = len(continue_probs) - stopped_early
+f = rec["predictions"][: s + 1] if rec["stopped_early"] else rec["predictions"][:s] + [Y]
+```
+
+`s` can be one more than `steps_run`: a run that ends inside a step after its draw (context
+overflow, repeated format errors, a format error on the last allowed call) counts that
+attempted step as the one that reveals Y.
+
+- A predictor or policy that takes a `task_id` keyword gets the task ID; before step 1 the prefix
+  is empty, so that is all the first prediction can go on. (Provisional until the shared
+  `Predictor` type in `src/shortstop` takes it.)
+- A policy gets `(prefix, predictions)` and returns p_k in (0, 1]; a predictor returns f in [0, 1].
+  Anything else, or an exception, raises `PredictorError`: `run_arm.py` starts no new tasks and
+  exits with an error, and the run is not retried as an infrastructure error.
 - No draw is made for a step that cannot happen. When the step or cost limit is about to end the
   run, the agent ends it without drawing, so a full run of T steps has exactly T entries in
   `continue_probs`.
 - Predictors and policies are built once per config and shared by all worker threads, so a learned
-  predictor is loaded once. It must be safe to call from several threads.
+  predictor is loaded once, by `run_arm.py` before any sandbox starts. It must be safe to call from
+  several threads.
+- With `save_diffs: true` (on in `base.yaml`) the agent saves the repository diff after each step
+  under `info.step_diffs`, built in a throwaway git index so neither the repository nor the model
+  sees it. `convert.py` writes them to `qwen-<arm>.diffs.jsonl`. A diff equal to the previous one
+  is saved as `"unchanged": true`, diffs are cut at 50,000 characters, and the submission step has
+  no row (its diff is the submitted patch in `preds.json`).
 
 ## Running it
 
@@ -130,12 +159,17 @@ pip install "mini-swe-agent[modal]==2.4.6" "swe-rex==1.4.0" python-dotenv  # pin
    python tool_ab/analyze.py
    ```
 
-   `convert.py` accepts any report with a `resolved_ids` list, or `{task: {"resolved": bool}}`.
+   `convert.py` accepts evaluate.py's report, the SWE-bench harness report, or
+   `{task: {"resolved": bool}}`. A task the report did not score (a grading error, or missing) is
+   left out as `NotScored`, not counted as unresolved; `evaluate.py` exits with an error when that
+   happens.
 
-6. **Rerun infrastructure failures.** A run that ended because a sandbox failed to start or the model
-   server dropped says nothing about the tool change. A sandbox that never started leaves an entry in
-   `preds.json` but no trajectory; those runs count as errors too (`NoTrajectory`). `convert.py` leaves it out (listed in
-   `qwen-<arm>.errors.json`) instead of scoring it as a failure. Rerun those tasks with
+6. **Rerun infrastructure failures.** A run that ended because a sandbox failed to start, lost its
+   connection, or the model server dropped says nothing about the tool change. A sandbox that never
+   started leaves an entry in `preds.json` but no trajectory (`NoTrajectory`); a lost sandbox
+   connection ends the run with `SandboxConnectionError`, and older runs in which any command lost
+   the connection count the same way. `convert.py` leaves these out (listed in
+   `qwen-<arm>.errors.json`) instead of scoring them as failures. Rerun those tasks with
    `python tool_ab/run_arm.py --arm <arm> --slice 0:100 --retry-errors`. Agent endings (submitted, step
    limit, repeated format errors, context overflow) are real results; see `shortstop_plugin/status.py`.
 
@@ -147,16 +181,20 @@ pip install "mini-swe-agent[modal]==2.4.6" "swe-rex==1.4.0" python-dotenv  # pin
   `run_arm.py` uses it for `environment_class: swerex_modal`. Plain `mini-extra swebench` with
   our configs does not get the fix.
 - **Sandboxes are terminated after each run.** Upstream, neither the batch runner nor swe-rex 1.4.0
-  terminates a live Modal sandbox, so each one would keep billing until `runtime_timeout` (2 h).
+  terminates a live Modal sandbox, so each one would keep billing until `deployment_timeout` (the
+  sandbox lifetime, 2 h; `runtime_timeout` is only the HTTP timeout of each call).
   `run_arm.py` and `environment.py` handle this. To check for leftovers after a crash:
   `python -c "import modal; a = modal.App.lookup('swe-rex'); print(list(modal.Sandbox.list(app_id=a.app_id)))"`.
-- **Stop records live beside the trajectories.** The shared format has no field for p_k, so
-  `convert.py` writes `qwen-<arm>.stops.json` next to each JSONL. If others need p_k too, it could move
-  into `src/shortstop/` (to discuss before changing the contract).
-- **Outcome -1 means not evaluated.** A run the plug-in stopped early has no final result; `convert.py`
-  writes its outcome as -1. Full runs (everything in the tool A/B experiment) are always 0 or 1.
-- **Same step definition as `coverage/`.** `shortstop_plugin/steps.py` counts steps and tokens like
-  `to_steps` in `coverage/download_swebench.py`: one model call plus its observations.
+- **Stop records live beside the trajectories.** The shared format has no field for predictions or
+  p_k, so `qwen-<arm>.stops.json` next to each JSONL is the agreed place for them.
+- **Outcome -1 means "stopped early, not evaluated".** A run the plug-in stopped early has no final
+  result; `convert.py` writes its outcome as -1. Infrastructure errors are not -1: they are left out
+  of the JSONL and listed in `qwen-<arm>.errors.json`. Full runs are always 0 or 1.
+- **Same step code as `coverage/`, different logs.** `shortstop_plugin/steps.py` counts steps like
+  `to_steps` in `coverage/download_swebench.py`: one model call plus its observations. But
+  mini-swe-agent 1.17.5 (the downloaded runs) logged a reply that failed to parse as a step, and
+  2.4.6 logs it only as an error message. Here such a call is not a step, and its tokens go to the
+  next step, so per-step counts are not directly comparable between the two.
 - **Departures from upstream mini-swe-agent:** step limit 100 instead of 250 (bounds compute), cost
   and wall-time limits off (a self-hosted model has no price, and run speed depends on server load,
   not on the tool change), and the runner swaps in the plug-in agent because mini-swe-agent's batch
