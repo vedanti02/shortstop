@@ -8,6 +8,8 @@ Sandbox.open; 5.0.2 references a missing TestSpec field), so this does the same 
 here: start the prebuilt task image, apply the patch (git apply, then patch --fuzz=5),
 run swebench's eval script, and grade the log with swebench's get_eval_report. Each
 sandbox is terminated when its task is done. Logs go to <out>/logs/<run-id>/<task>/.
+The report is written either way; the script exits with an error if any task could not be
+graded (listed under error_ids).
 """
 
 from __future__ import annotations
@@ -145,6 +147,9 @@ def main(argv: list[str] | None = None) -> None:
     path.write_text(json.dumps(report, indent=1))
     print(f"{args.run_id}: {len(report['resolved_ids'])}/{len(ids)} resolved, "
           f"{len(report['error_ids'])} errors -> {path}")
+    if report["error_ids"]:
+        raise SystemExit(f"{len(report['error_ids'])} tasks could not be graded; see 'errors' in {path}. "
+                         "convert.py leaves them out; rerun evaluate.py with --instance-ids to score them.")
 
 
 if __name__ == "__main__":

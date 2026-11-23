@@ -10,7 +10,12 @@ instead, so the extra variables (BASH_ENV among them) are added on top of the im
 
 It also terminates its sandbox on stop. swe-rex 1.4.0's ModalDeployment.stop() only calls
 terminate() on a sandbox that has already exited, so a live one keeps running (and billing)
-until its runtime_timeout. A sandbox whose runtime fails to start is terminated as well.
+until its deployment_timeout. A sandbox whose runtime fails to start is terminated as well.
+
+A lost connection to the sandbox ("Cannot connect to host", "Connection reset by peer") raises
+SandboxConnectionError instead of becoming an observation, so the run ends as an
+infrastructure error and `run_arm.py --retry-errors` reruns it. Other runtime failures (a
+command timeout, an argument list too long) are still shown to the agent.
 """
 
 from __future__ import annotations
@@ -23,10 +28,21 @@ from typing import Any
 from minisweagent.environments.extra.swerex_modal import SwerexModalEnvironment
 from swerex.runtime.abstract import Command as RexCommand
 
+from .status import CONNECTION_ERROR_TYPES
+
 CLASS_PATH = f"{__name__}.BashModalEnvironment"
 STOP_TIMEOUT_SECONDS = 10
 
 logger = logging.getLogger(__name__)
+
+
+class SandboxConnectionError(RuntimeError):
+    """The sandbox stopped answering. Ends the run as an infrastructure error (see status.py)."""
+
+
+def is_connection_failure(error: BaseException) -> bool:
+    """A failure to reach the sandbox, as opposed to a command that failed inside it."""
+    return any(cls.__name__ in CONNECTION_ERROR_TYPES for cls in type(error).__mro__)  # by name: no aiohttp import
 
 
 def wrap_in_bash(command: str, env: dict[str, str]) -> str:
@@ -58,7 +74,9 @@ class BashModalEnvironment(SwerexModalEnvironment):
         try:
             result = asyncio.run(self.deployment.runtime.execute(rex_command))
             output = {"output": result.stdout, "returncode": result.exit_code, "exception_info": ""}
-        except Exception as e:  # noqa: BLE001 -- the agent sees any runtime failure, as in the parent class
+        except Exception as e:  # the agent sees any other runtime failure, as in the parent class
+            if is_connection_failure(e):
+                raise SandboxConnectionError(f"Lost the connection to the sandbox: {e}") from e
             output = {
                 "output": str(e) if str(e) else "",
                 "returncode": -1,

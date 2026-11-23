@@ -97,6 +97,40 @@ def test_a_runtime_failure_becomes_an_observation(env):
     assert out["extra"]["exception_type"] == "TimeoutError"
 
 
+class ClientOSError(OSError):
+    """Stands in for aiohttp's "Connection reset by peer" error (matched by class name)."""
+
+
+@pytest.mark.parametrize("error", [ClientOSError("Connection reset by peer"),
+                                   ConnectionRefusedError("Cannot connect to host")])
+def test_a_lost_sandbox_connection_ends_the_run_as_an_infrastructure_error(env, error):
+    from shortstop_plugin.environment import SandboxConnectionError
+    from shortstop_plugin.status import SANDBOX_CONNECTION_ERROR, is_infra_error
+
+    async def lost(command):
+        raise error
+
+    env.deployment.runtime.execute = lost
+    with pytest.raises(SandboxConnectionError, match="Lost the connection"):
+        env.execute({"command": "ls"})
+    assert SandboxConnectionError.__name__ == SANDBOX_CONNECTION_ERROR
+    assert is_infra_error(SANDBOX_CONNECTION_ERROR)
+
+
+def test_saved_runs_with_connection_failures_count_as_infrastructure_errors():
+    from shortstop_plugin.status import infra_error_of
+
+    def traj(exit_status, exception_type=None):
+        extra = {"exception_type": exception_type} if exception_type else {}
+        return {"info": {"exit_status": exit_status}, "messages": [{"role": "tool", "extra": extra}]}
+
+    assert infra_error_of(traj("Submitted", "ClientConnectorError")) == "SandboxConnectionError"
+    assert infra_error_of(traj("Submitted", "CommandTimeoutError")) is None  # the agent's slow command
+    assert infra_error_of(traj("Submitted", "OSError")) is None  # e.g. argument list too long
+    assert infra_error_of(traj("DeploymentStartupError")) == "DeploymentStartupError"
+    assert infra_error_of(traj("Submitted")) is None
+
+
 def test_stop_terminates_a_sandbox_that_is_still_running(env):
     sandbox = env.deployment._sandbox
     env.stop()

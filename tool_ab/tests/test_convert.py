@@ -84,3 +84,61 @@ def test_tasks_in_preds_without_a_trajectory_are_errors(tmp_path):
     records, _, errors = convert_arm(runs, resolved=set(), agent="a")
     assert {r["task_id"] for r in records} == {"ok"}
     assert errors == {"lost": "NoTrajectory"}
+
+
+def test_tasks_the_report_did_not_score_are_left_out_not_counted_as_failures(tmp_path):
+    from convert import load_report
+
+    runs = tmp_path / "runs"
+    for task in ["ok", "graded_fail", "grading_error", "missing"]:
+        write_traj(runs, task, 1)
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({"resolved_ids": ["ok"], "unresolved_ids": ["graded_fail"],
+                                  "error_ids": ["grading_error"]}))
+    resolved, scored = load_report(report)
+    records, _, errors = convert_arm(runs, resolved, "a", scored)
+    assert {(r["task_id"], r["outcome"]) for r in records} == {("ok", 1), ("graded_fail", 0)}
+    assert errors == {"grading_error": "NotScored", "missing": "NotScored"}
+
+
+def test_reports_that_cannot_say_what_they_scored():
+    import tempfile
+    from pathlib import Path
+
+    from convert import load_report
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.json"
+        path.write_text(json.dumps({"resolved_ids": ["a"]}))
+        assert load_report(path) == ({"a"}, None)
+        path.write_text(json.dumps({"a": {"resolved": True}, "b": {"resolved": False}, "c": {}}))
+        assert load_report(path) == ({"a"}, {"a", "b"})
+
+
+def test_runs_that_lost_the_sandbox_connection_are_errors(tmp_path):
+    runs = tmp_path / "runs"
+    write_traj(runs, "dead", 2)
+    path = runs / "dead" / "dead.traj.json"
+    data = json.loads(path.read_text())
+    data["messages"][-1]["extra"] = {"exception_type": "ClientOSError"}
+    path.write_text(json.dumps(data))
+    records, _, errors = convert_arm(runs, resolved=set(), agent="a")
+    assert records == [] and errors == {"dead": "SandboxConnectionError"}
+
+
+def test_step_diffs_are_written_beside_the_trajectories(tmp_path):
+    from convert import collect_diffs
+
+    runs = tmp_path / "runs"
+    write_traj(runs, "t1", 1)
+    write_traj(runs, "t2", 1)
+    path = runs / "t1" / "t1.traj.json"
+    data = json.loads(path.read_text())
+    data["info"]["step_diffs"] = [{"step": 1, "diff": "+x", "returncode": 0}]
+    path.write_text(json.dumps(data))
+    diffs = collect_diffs(runs, "qwen-a", {"t1", "t2"})
+    assert diffs == [{"task_id": "t1", "agent": "qwen-a", "step": 1, "diff": "+x", "returncode": 0}]
+    write_arm([], {}, tmp_path / "out", "qwen-a", diffs=diffs)
+    assert (tmp_path / "out" / "qwen-a.diffs.jsonl").read_text().count("\n") == 1
+    write_arm([], {}, tmp_path / "out2", "qwen-a")
+    assert not (tmp_path / "out2" / "qwen-a.diffs.jsonl").exists()

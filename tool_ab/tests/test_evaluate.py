@@ -136,3 +136,14 @@ def test_main_writes_a_report_convert_can_read(tmp_path, monkeypatch):
 
     assert seen == {"ids": ["a"], "workers": 3}
     assert convert.load_resolved(tmp_path / "eval" / "smoke.json") == {"a"}
+
+
+def test_main_writes_the_report_and_fails_when_tasks_could_not_be_graded(tmp_path, monkeypatch):
+    preds = tmp_path / "preds.json"
+    preds.write_text(json.dumps({"a": {"instance_id": "a", "model_patch": PATCH}}))
+    monkeypatch.setattr(evaluate, "load_specs", lambda dataset, ids: [spec(t) for t in ids])
+    monkeypatch.setattr(evaluate, "evaluate_all", lambda *a, **k: {
+        "resolved_ids": [], "unresolved_ids": [], "error_ids": ["a"], "errors": {"a": "boom"}})
+    with pytest.raises(SystemExit, match="could not be graded"):
+        evaluate.main(["--preds", str(preds), "--run-id", "r", "--out", str(tmp_path / "eval")])
+    assert json.loads((tmp_path / "eval" / "r.json").read_text())["error_ids"] == ["a"]

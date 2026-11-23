@@ -21,8 +21,36 @@ AGENT_OUTCOMES = frozenset({
 })
 
 
+SANDBOX_CONNECTION_ERROR = "SandboxConnectionError"
+# Exception types (as logged under a message's extra.exception_type) that mean the connection to
+# the sandbox failed, not the agent's command: aiohttp's "Cannot connect to host" and
+# "Connection reset by peer", and Python's own connection errors.
+CONNECTION_ERROR_TYPES = frozenset({
+    "ClientConnectorError", "ClientOSError", "ServerDisconnectedError", "ClientConnectionError",
+    "ServerTimeoutError", "ClientPayloadError",
+    "ConnectionError", "ConnectionResetError", "ConnectionRefusedError", "ConnectionAbortedError",
+    "BrokenPipeError",
+})
+
+
 def is_infra_error(exit_status: str | None) -> bool:
     return exit_status not in AGENT_OUTCOMES
+
+
+def infra_error_of(traj: dict) -> str | None:
+    """Why a saved run is an infrastructure error, or None if it is a real result.
+
+    Besides the exit status, a run in which any command lost its connection to the sandbox is
+    an infrastructure error: runs saved before environment.py raised on these failures passed
+    them to the agent as observations and ended normally.
+    """
+    exit_status = (traj.get("info") or {}).get("exit_status")
+    if is_infra_error(exit_status):
+        return str(exit_status)
+    for msg in traj.get("messages") or []:
+        if (msg.get("extra") or {}).get("exception_type") in CONNECTION_ERROR_TYPES:
+            return SANDBOX_CONNECTION_ERROR
+    return None
 
 
 NO_TRAJECTORY = "NoTrajectory"

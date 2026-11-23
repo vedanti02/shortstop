@@ -102,11 +102,18 @@ def point_at_model_server() -> None:
 def run_arm_job(arm: str, run_name: str, slice_spec: str, workers: int) -> str:
     point_at_model_server()
     root = VOLUME_ROOT / run_name
+    notes = []
+    report = root / "eval" / f"{arm}.json"
     for command in arm_commands(arm, root, slice_spec, workers):
+        is_evaluate = command[1].endswith("evaluate.py")
+        if is_evaluate:
+            report.unlink(missing_ok=True)  # so convert can never grade against an earlier attempt's report
         code = run_and_commit(command, root / "logs" / f"{arm}.log")
-        if code != 0:
+        if code != 0 and is_evaluate and report.exists():
+            notes.append(f"some tasks not graded (exit {code}); convert.py leaves them out")
+        elif code != 0:
             return f"{arm}: FAILED (exit {code}) at: {' '.join(command[1:3])}"
-    return f"{arm}: done"
+    return f"{arm}: done" + "".join(f" ({n})" for n in notes)
 
 
 @app.function(image=image, volumes={str(VOLUME_ROOT): runs_volume}, timeout=DAY_SECONDS)
