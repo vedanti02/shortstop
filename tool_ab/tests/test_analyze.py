@@ -52,3 +52,16 @@ def test_load_runs_sums_tokens_per_task(tmp_path):
     path = tmp_path / "a.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in rows))
     assert load_runs(path) == {"t1": {"outcome": 1, "tokens": 35, "steps": 2}}
+
+
+@pytest.mark.parametrize(("lo", "hi", "p", "diff", "expected"), [
+    (-0.23, -0.05, 0.007, -0.14, "worse"),
+    (-0.15, -0.01, 0.057, -0.08, "borderline worse"),  # the CI alone
+    (-0.10, 0.01, 0.04, -0.05, "borderline worse"),  # McNemar alone
+    (-0.14, 0.02, 0.238, -0.06, "no detectable difference"),
+    (0.1, 0.3, 0.001, 0.2, "better"),
+])
+def test_verdict_needs_both_tests_for_a_firm_call(lo, hi, p, diff, expected):
+    from analyze import verdict_of
+
+    assert verdict_of(lo, hi, p, diff) == expected

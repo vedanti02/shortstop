@@ -6,7 +6,8 @@
 For every task run in both arms, the paired difference in outcome is arm minus baseline.
 Reports both resolve rates, the difference with a 95% paired bootstrap interval, the exact
 McNemar p-value, and mean tokens per run. The verdict is "better" or "worse" when the
-interval excludes zero, otherwise "no detectable difference". These full-run verdicts are
+interval excludes zero and McNemar p < 0.05, "borderline better" or "borderline worse" when
+only one of the two says so, otherwise "no detectable difference". These full-run verdicts are
 the reference the early-stopped A/B results are checked against at integration.
 """
 
@@ -55,6 +56,19 @@ def paired_bootstrap_ci(diffs, n_boot: int = 10_000, seed: int = 0, alpha: float
     return float(lo), float(hi)
 
 
+ALPHA = 0.05
+
+
+def verdict_of(ci_low: float, ci_high: float, p_value: float, diff: float) -> str:
+    """Both tests must agree for a firm verdict; one alone gives a borderline one."""
+    ci_says = ci_low > 0 or ci_high < 0
+    mcnemar_says = p_value < ALPHA
+    if not (ci_says or mcnemar_says) or diff == 0:
+        return "no detectable difference"
+    direction = "better" if diff > 0 else "worse"
+    return direction if ci_says and mcnemar_says else f"borderline {direction}"
+
+
 def compare(base: dict, arm: dict, n_boot: int = 10_000, seed: int = 0) -> dict:
     tasks = sorted(base.keys() & arm.keys())
     if not tasks:
@@ -66,7 +80,8 @@ def compare(base: dict, arm: dict, n_boot: int = 10_000, seed: int = 0) -> dict:
     arm_better, base_better = int((diffs == 1).sum()), int((diffs == -1).sum())
     base_tokens = float(np.mean([base[t]["tokens"] for t in tasks]))
     arm_tokens = float(np.mean([arm[t]["tokens"] for t in tasks]))
-    verdict = "better" if lo > 0 else "worse" if hi < 0 else "no detectable difference"
+    p_value = mcnemar_exact(arm_better, base_better)
+    verdict = verdict_of(lo, hi, p_value, float(diffs.mean()))
     return {
         "n_tasks": len(tasks),
         "base_rate": float(y_base.mean()),
@@ -76,7 +91,7 @@ def compare(base: dict, arm: dict, n_boot: int = 10_000, seed: int = 0) -> dict:
         "ci_high": hi,
         "arm_better": arm_better,
         "base_better": base_better,
-        "p_value": mcnemar_exact(arm_better, base_better),
+        "p_value": p_value,
         "base_tokens": base_tokens,
         "arm_tokens": arm_tokens,
         "token_ratio": arm_tokens / base_tokens if base_tokens else float("nan"),
