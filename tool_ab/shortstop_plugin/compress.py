@@ -25,7 +25,9 @@ class CompressionConfig(BaseModel):
 
 
 def _clean_line(line: str, max_line_chars: int) -> str:
-    line = line.rstrip("\r").rsplit("\r", 1)[-1]  # CRLF endings stay; progress redraws collapse
+    # A trailing \r (a CRLF ending) is dropped, keeping the line's text; a progress bar redrawn
+    # with \r keeps only its final state.
+    line = line.rstrip("\r").rsplit("\r", 1)[-1]
     if len(line) > max_line_chars:
         return f"{line[:max_line_chars]} ...[{len(line) - max_line_chars} more chars]"
     return line

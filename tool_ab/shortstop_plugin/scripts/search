@@ -3,7 +3,8 @@
 #
 #   search PATTERN [PATH]       lines matching PATTERN (extended regex), grouped by file
 #   search -i PATTERN [PATH]    same, ignoring case
-#   search -f NAME [PATH]       files whose path contains NAME
+#   search -f NAME [PATH]       files whose path contains NAME (-i -f: ignoring case)
+#   search -- -PATTERN [PATH]   a pattern that starts with a dash
 #
 # PATH may be a directory or a single file. Skips .git, caches and binary files. Results are
 # sorted by file and line; at most 50 matching lines and 30 files are shown.
@@ -15,7 +16,7 @@ MAX_LINE_CHARS=200
 SKIP_DIRS=(.git __pycache__ node_modules .tox .mypy_cache .pytest_cache)
 
 usage() {
-    echo "usage: search [-i] PATTERN [PATH] | search -f NAME [PATH]"
+    echo "usage: search [-i] [--] PATTERN [PATH] | search [-i] -f NAME [PATH]"
     exit 2
 }
 
@@ -25,11 +26,16 @@ plural() {  # plural COUNT WORD -> "1 file" / "3 files"
 
 mode="content"
 case_flag=""
-case "${1:-}" in
-    -f) mode="files"; shift ;;
-    -i) case_flag="-i"; shift ;;
-    -h|--help|"") usage ;;
-esac
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f) mode="files"; shift ;;
+        -i) case_flag="-i"; shift ;;
+        -if|-fi) mode="files"; case_flag="-i"; shift ;;
+        --) shift; break ;;
+        -h|--help) usage ;;
+        *) break ;;
+    esac
+done
 [ $# -ge 1 ] || usage
 pattern="$1"
 root="${2:-.}"
@@ -46,7 +52,7 @@ if [ "$mode" = "files" ]; then
     done
     unset 'prune[${#prune[@]}-1]'
     matches=$(find "$root" \( "${prune[@]}" \) -prune -o -type f -print 2>/dev/null \
-              | grep -F -- "$pattern" | sed 's|^\./||' | LC_ALL=C sort)
+              | grep -F $case_flag -- "$pattern" | sed 's|^\./||' | LC_ALL=C sort)
     if [ -z "$matches" ]; then
         echo "No files matching '$pattern' under $root"
         exit 1

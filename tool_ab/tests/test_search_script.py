@@ -91,3 +91,20 @@ def test_search_does_not_hide_build_directories(tmp_path):
     (tmp_path / "build" / "core.py").write_text("needle\n")
     code, out = run_search(tmp_path, "needle")
     assert code == 0 and "build/core.py" in out
+
+
+def test_flags_can_be_combined_in_any_order(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "pkg" / "Admin.py").write_text("x = 1\n")
+    for args in (["-i", "-f", "admin"], ["-f", "-i", "admin"]):
+        code, out = run_search(repo, *args)
+        assert code == 0 and "pkg/Admin.py" in out, args
+    code, out = run_search(repo, "-f", "admin")
+    assert code == 1  # case-sensitive without -i
+
+
+def test_a_pattern_starting_with_a_dash_after_double_dash(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "pkg" / "flags.py").write_text("opt = '-verbose'\n")
+    code, out = run_search(repo, "--", "-verbose")
+    assert code == 0 and "pkg/flags.py" in out

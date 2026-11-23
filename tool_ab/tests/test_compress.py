@@ -52,5 +52,5 @@ def test_compress_result_returns_a_new_dict():
     assert original["output"] == "\x1b[1mhi\x1b[0m"
 
 
-def test_crlf_line_endings_keep_their_text():
+def test_crlf_endings_are_dropped_and_the_text_kept():
     assert compress_text("line one\r\nline two\r\n", CFG) == "line one\nline two\n"
