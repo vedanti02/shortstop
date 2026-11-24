@@ -32,9 +32,10 @@ Four sections:
                 steps so far can make (the plug-in as written).
     4 ab        Each tool change against the baseline, paired by task, under the standard design
                 (mean +/- 1.96 sd / sqrt(n) of the per-task differences), with each task's
-                stopping uniform shared by both arms or drawn separately. On the same 100 tasks:
-                how often the full-run verdict is reached, and the tokens spent. With tasks
-                resampled (batches of 100, and of 500 for the calibrated rows): the compute for
+                stopping uniform shared by both arms or drawn separately. On the tasks both arms
+                ran (all 100, or 99 when one run is an infrastructure error): how often the
+                full-run verdict is reached, and the tokens spent. With tasks resampled
+                (batches as large, and of 500 for the calibrated rows): the compute for
                 the same precision, and the coverage. Larger kappas are also tried as trained;
                 those are tuned on these runs, so optimistic.
 
@@ -131,6 +132,14 @@ def run_arrays(g: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def arm_arrays(pred: pd.DataFrame, arm: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return run_arrays(pred[pred["agent"] == f"qwen-{arm}"])
+
+
+def pair_arrays(pred: pd.DataFrame, arm: str) -> tuple[tuple, tuple]:
+    """Baseline and arm arrays on the tasks both arms ran, in the same order. A task missing from
+    one arm (an infrastructure error, listed in its errors.json) is left out of that comparison."""
+    base, other = pred[pred["agent"] == "qwen-baseline"], pred[pred["agent"] == f"qwen-{arm}"]
+    both = set(base["task_id"]) & set(other["task_id"])
+    return run_arrays(base[base["task_id"].isin(both)]), run_arrays(other[other["task_id"].isin(both)])
 
 
 def first_half(pred: pd.DataFrame) -> np.ndarray:
@@ -321,18 +330,18 @@ def section_ab(variants: dict, kappa: float, draws: int, replicates: int, pool, 
     labels, jobs = [], []
     for j, arm in enumerate(ARMS[1:]):
         for c in ["as trained", "cross-fit baseline"]:
-            pair = (arm_arrays(variants[c][0], "baseline"), arm_arrays(variants[c][0], arm))
+            pair = pair_arrays(variants[c][0], arm)
             for shared in [True, False]:
                 for tasks in [None] if c == "as trained" else [None, 500]:
                     labels.append((arm, c))
                     jobs.append((*pair, kappa, shared, draws, replicates, 100 + j, tasks))
-        pair = (arm_arrays(variants["as trained"][0], "baseline"), arm_arrays(variants["as trained"][0], arm))
+        pair = pair_arrays(variants["as trained"][0], arm)
         for scale in KAPPA_SCALES[1:]:
             labels.append((arm, "as trained"))
             jobs.append((*pair, kappa * scale, True, draws, replicates, 100 + j, None))
     ab = pd.DataFrame([{"change": a, "calibration": c, **r} for (a, c), r in zip(labels, pool.starmap(compare, jobs))])
     ab.to_csv(RESULTS / f"tool_ab_ab{tag}.csv", index=False)
-    print("\n4. Tool change vs baseline, standard design (same 100 tasks: verdict kept, tokens, width vs "
+    print("\n4. Tool change vs baseline, standard design (the tasks both arms ran: verdict kept, tokens, width vs "
           "full runs; resampled batches of `tasks`: compute for the same precision, coverage)")
     with pd.option_context("display.width", 250):
         show = ab.assign(kappa=ab["kappa"].round(3))[[

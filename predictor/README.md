@@ -168,15 +168,15 @@ earlier full runs of the same agent; tasks outside the batch are fine. Calibrate
 starts and keep the shift fixed: it is then part of the predictor, so every run's estimate stays
 exactly unbiased.
 
-- **It matters most for agents unlike the training agents.** On Rishi's Qwen runs (26 to 40%
-  solved), the standard design's compute falls from 84–170% of full runs to 49–65%, and its
-  coverage rises from 86–88% to 94–96% (`tool_ab_check.py`; each half of the tasks is
-  calibrated on the other half).
+- **It matters most for agents unlike the training agents.** On Rishi's Qwen runs (26 to 39%
+  solved; the v2 data of Nov 23), the standard design's compute falls from 84–171% of full runs
+  to 47–69%, and its coverage rises from 87–88% to 94–96% (`tool_ab_check.py`; each half of the
+  tasks is calibrated on the other half).
 - **For a tool A/B test**, give both arms the same shift (the baseline's) and the same seed, so
   their step-0 predictions and stopping draws match.
 - **Without earlier runs**, Vedanti's in-batch correction (`coverage/adaptive.py`) learns the
   shift during the batch. On Qwen's 100 tasks it learns only about half of it: the baseline
-  arm's compute goes from 98% to 84% (tracking policy).
+  arm's compute goes from 97% to 82% (tracking policy).
 - **The price of a uniform shift is at the tail.** On the 37 training agents its oracle version
   saves 14 to 16% of compute, but the worst agent's coverage drops to 86–90% (see "Agent
   calibration is the larger lever").
