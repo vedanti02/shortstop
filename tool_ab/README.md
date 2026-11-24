@@ -31,18 +31,22 @@ Full run, 2026-11-21: the first 100 tasks of `configs/tasks.txt`, Qwen3-Coder-30
 four arms, every patch scored. 10 of the 400 runs lost their sandbox connection partway
 ("Cannot connect to host", "Connection reset by peer"; 1 baseline, 2 descriptions, 4 search,
 3 compressed). The run code at the time showed those failures to the agent instead of ending
-the run, so they are now classed as infrastructure errors and left out until rerun; each
-comparison uses the tasks both arms have.
+the run, so they were classed as infrastructure errors and rerun on 2026-11-23 with the fixed
+code (run `full-100-v2`). 9 of the 10 finished; `search/sphinx-doc__sphinx-7454` lost its
+connection again late in the run (both times during a Sphinx build), so it stays excluded
+and the search comparison uses the 99 tasks both arms have.
 
 | Change | Tasks | Baseline | With change | Difference (95% CI) | Wins / losses | McNemar p | Tokens | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| descriptions | 97 | 40.2% | 26.8% | -13.4 (-22.7 to -4.1) | 5 / 18 | 0.011 | 1.25x | worse |
-| search | 95 | 41.1% | 35.8% | -5.3 (-13.7 to +3.2) | 6 / 11 | 0.332 | 1.15x | no detectable difference |
-| compressed | 96 | 39.6% | 31.2% | -8.3 (-15.6 to -1.0) | 3 / 11 | 0.057 | 0.92x | borderline worse |
+| descriptions | 100 | 39.0% | 26.0% | -13.0 (-22.0 to -4.0) | 5 / 18 | 0.011 | 1.26x | worse |
+| search | 99 | 39.4% | 34.3% | -5.1 (-13.1 to +3.0) | 6 / 11 | 0.332 | 1.11x | no detectable difference |
+| compressed | 100 | 39.0% | 32.0% | -7.0 (-15.0 to +0.0) | 4 / 11 | 0.118 | 0.94x | no detectable difference |
 
-A verdict is firm when the bootstrap interval excludes zero and McNemar p < 0.05, and
-borderline when only one of them does. None of the three tool changes helps this model;
-longer tool descriptions clearly hurt it. Tokens include failed model calls (see
+Resolved out of 100: baseline 39, descriptions 26, search 34, compressed 32. A verdict is firm
+when the bootstrap interval excludes zero and McNemar p < 0.05, and borderline when only one
+of them does. Before the rerun, compressed was borderline worse (p = 0.057, 96 tasks); with all
+100 tasks neither test excludes zero. None of the three tool changes helps this model; longer
+tool descriptions clearly hurt it. Tokens include failed model calls (see
 `shortstop_plugin/steps.py`). The whole run cost about $44 of Modal compute (about 15 h; the
 GPU server is two thirds of it). Trajectories in the shared format (`qwen-*.jsonl`) stay out
 of git, like all run data.
