@@ -59,7 +59,7 @@ needs a second reader, and very weak agents are still expensive. See
 
 - [In short](#in-short): results, what worked and what did not
 - [Key terms](#key-terms): the words used throughout
-- [How to use it](#how-to-use-it): the runtime's three designs, and predictions for Vedanti's plots
+- [How to use it](#how-to-use-it): the runtime's three designs, Rishi's plug-in (adapter, logging, monitoring), and predictions for Vedanti's plots
 - [Run it](#run-it): every command, in order
 - [Files](#files): what each script does
 - [Learned remaining cost: a trained component that beats the hand-made policies](#learned-remaining-cost-a-trained-component-that-beats-the-hand-made-policies): main result 1
@@ -310,6 +310,118 @@ half-widths would be 0.040 (Sonnet) and 0.038 (gpt-oss-120b).
   1.2x. Under the balanced designs only Qwen2.5-Coder-32B does, at 1.4x (`balanced`) and 1.3x
   (`balanced-unproven`).
 
+### With Rishi's plug-in: the adapter, logging and monitoring
+
+`plugin_adapter.py` connects Rishi's mini-swe-agent plug-in (`tool_ab/shortstop_plugin`, PR #3)
+to the runtime. Before every step the plug-in asks for a prediction and a continue probability,
+passing the task ID; the adapter answers exactly as the runtime's `standard` design does, and logs
+every decision. `live_monitor.py` watches the batch while it runs and scores it once it is graded.
+
+**Config, per arm** (the plug-in's agent config):
+
+```yaml
+predictor: plugin_adapter.predictor
+predictor_kwargs:
+  runtime: data/predictor/runtime/all
+  tasks_file: tool_ab/configs/tasks.txt
+  slice: "0:100"                                    # the run's --slice
+  calibrate_from: data/tool_ab/qwen-baseline.jsonl  # optional: earlier full runs of the agent
+  arm: baseline
+  log: data/predictor/live/baseline.decisions.jsonl
+stop_policy: plugin_adapter.policy
+stop_policy_kwargs: {}                              # uses the predictor's session
+seed: 0                                             # the same seed in every arm
+```
+
+and run the plug-in with `predictor/` on the import path:
+`PYTHONPATH=predictor python tool_ab/run_arm.py --arm baseline --slice 0:100`.
+
+- **What the environment needs.** numpy, pandas, scipy, lightgbm and pyarrow, plus the
+  `shortstop` package; not scikit-learn, which only the offline scripts use (a test checks
+  this). Files: `predictor/`, the model folder `data/predictor/runtime/all/` and the gold patch
+  table `data/meta/swebench_verified.parquet`. Relative paths in the settings are read from the
+  repo root.
+- **Settings once.** The settings go to the predictor only; the policy without settings uses the
+  predictor's session, so the two cannot drift apart between a base config and an arm's overlay.
+  A policy given settings must be given exactly the predictor's.
+- **Standard design only.** The plug-in draws each task's random number itself, from the seed and
+  the task, which is right for independent stopping. The balanced designs deal the numbers across
+  a group of tasks, so they would need the plug-in to take each task's number from the plan; at
+  100 tasks per arm `standard` is the better choice anyway.
+- **For an A/B test** give every arm the same `calibrate_from` (the baseline's earlier runs) and
+  the same seed: the arms then share step-0 predictions and random numbers, so they stop at
+  matching points.
+- **It fails loudly.** A missing task ID, a task outside the plan, an unknown setting, or a policy
+  whose predictions differ from the predictor's raises; the plug-in turns that into a
+  `PredictorError` and starts no more tasks. The models load before any sandbox starts (the
+  plug-in builds both callables first), so a missing file stops the run at once. Every decision
+  takes about 2 ms (10 to 13 ms with 8 runs at once).
+
+**Logging.** One JSON line per event in `log`, flushed as it is written; the same events go to the
+Python logger `shortstop.adapter`.
+
+| Event | When | What it records |
+| --- | --- | --- |
+| `session` | at start | arm, tasks, calibration shift, mean step-0 prediction, kappa, floor, cost scale, settings |
+| `run_start` | a task's run begins (also a rerun) | attempt, f0, expected tokens, P_1 |
+| `decision` | before every step | step k, f, expected remaining tokens, P_k, p_k, at the floor, tokens so far, time taken |
+| `error` | a call fails | which call, the step, the error |
+
+**Monitoring.**
+
+```bash
+python -I predictor/live_monitor.py status --log data/predictor/live/baseline.decisions.jsonl \
+    --runs data/tool_ab/runs/baseline --reference data/tool_ab/qwen-baseline.jsonl --watch 60
+python -I predictor/live_monitor.py report --data data/tool_ab --arms baseline descriptions search compressed \
+    --baseline baseline --logs data/predictor/live
+```
+
+- `status`, during the batch: runs started, running and ended (and how they ended), tokens spent
+  against earlier full runs of the same tasks (`--reference`; without it the cost model's step-0
+  estimate, which put Qwen's full runs at about half their real cost), decision times, a running
+  score on the runs that have ended (`--grades` adds the finished ones), and alerts.
+- `report`, after grading, from `tool_ab/convert.py`'s output: each arm's score and 95% interval,
+  and each arm minus the baseline, paired by task; `--truth` adds full runs to compare with.
+- Exit status 2 if any alert is critical, and 1 with `--strict` if any is a warning, so a
+  scheduler can act on it.
+
+| Alert | What sets it off |
+| --- | --- |
+| Critical | A predictor or policy call failed. A stop record breaks a rule: as many predictions as continue probabilities, predictions in [0, 1], probabilities in (0, 1], s = len(continue_probs) - stopped_early, reach never below the floor, outcome -1 exactly for the runs stopped early. A record differs from the decisions the adapter logged. |
+| Warning | Decisions slower than `--latency-ms`. A run with no decision for `--stall-minutes` that has not ended. Runs that ended in infrastructure errors. Runs for tasks outside the plan. Settings that changed between sessions. After 20 scored runs, a mean step-0 prediction outside the running interval (calibrate). A/B arms with different seeds or shifts. A missing decision log. |
+| Info | How many records were checked; reruns. |
+
+**Rehearsal with the real plug-in** (`plugin_rehearsal.py`, in an environment with mini-swe-agent
+2.4.6, pointed at Rishi's `tool_ab` folder). It replays logged runs through `StoppingAgent` with
+a scripted model and an environment that returns the logged outputs, so nothing is executed, then
+converts the runs with Rishi's `convert.py`. On the four Qwen v2 arms (seed 0, every arm
+calibrated on the baseline's earlier runs; `live_monitor.py report --truth data/tool_ab`):
+
+| Arm | Tasks | Score (95% interval) | Started | Stopped early | Tokens | True rate | Share of full-run tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline | 100 | 0.409 (0.248 to 0.569) | 16 | 88 | 6.76M | 0.390 (covered) | 9.7% |
+| descriptions | 100 | 0.242 (0.070 to 0.414) | 16 | 88 | 7.27M | 0.260 (covered) | 8.2% |
+| search | 99 | 0.214 (0.022 to 0.406) | 16 | 88 | 4.96M | 0.343 (covered) | 6.6% |
+| compressed | 100 | 0.284 (0.110 to 0.458) | 16 | 89 | 5.63M | 0.320 (covered) | 8.6% |
+
+| Change | Tasks | Difference (95% interval) | Verdict | True difference |
+| --- | --- | --- | --- | --- |
+| descriptions | 100 | -0.167 (-0.363 to +0.030) | no detectable difference | -0.130 |
+| search | 99 | -0.196 (-0.431 to +0.038) | no detectable difference | -0.051 |
+| compressed | 100 | -0.125 (-0.311 to +0.062) | no detectable difference | -0.070 |
+
+- **The plug-in path is exact.** The plug-in rebuilt every logged step, so every prediction it
+  recorded equals the offline one, and every record passes the checks and matches the log.
+- **Each arm alone works:** all four intervals contain the true rate, with 6.6 to 9.7% of the
+  full-run tokens.
+- **The A/B differences gain little at 100 tasks,** as offline: all four come out as no
+  detectable difference, including descriptions, which full runs find worse.
+- **Over 30 seeds of the baseline arm** (the same rehearsal with other random numbers), the mean score
+  is 0.409 against a true 0.390 (standard error 0.016, so no sign of bias), and 29 of the 30
+  intervals contain the true rate, with 10.7% of the full-run tokens on average.
+- The calibration uses the same tasks' earlier outcomes (Qwen has no other full runs), so these
+  runs favour the method a little; a live batch on the same tasks has new luck in every run.
+
 ### For coverage/ (Vedanti's plots)
 
 The held-out gold LightGBM predictions in Vedanti's format (agent, task_id, k, f, next_cost,
@@ -368,6 +480,10 @@ python predictor/export.py runtime --exclude <agent>  # the same without one age
 python predictor/demo_runtime.py <agent>              # replay that agent (--design all for every design)
 python predictor/export.py coverage --split loao      # predictions in Vedanti's format
 python -I predictor/tool_ab_check.py                  # Rishi's tool A/B runs, unzipped into data/tool_ab/
+<python with mini-swe-agent> -I predictor/plugin_rehearsal.py --tool-ab <tool_ab> --arm baseline \
+    --calibrate-from data/tool_ab/qwen-baseline.jsonl     # the real plug-in on logged runs
+python -I predictor/live_monitor.py status --log <out>/baseline/decisions.jsonl --runs <out>/baseline/runs
+python -I predictor/live_monitor.py report --data <out>/baseline --arms baseline --truth data/tool_ab
 ```
 
 **4. The second benchmark: the SWE-rebench leaderboard**
@@ -433,6 +549,9 @@ at the top of the file.
 | `export.py` | Predictions for coverage/ (`coverage`) and deployable models for a live harness (`runtime`; `--seeds 3` for the seed-averaged models) |
 | `runtime.py` | Run-time interface: predictions, cost-aware stopping, estimate and interval, under any design (`standard`, `balanced` or `balanced-unproven`) |
 | `demo_runtime.py` | Replays a held-out agent's logged runs through `runtime.py` as a live harness would, under any design (`--ensemble 3` for the seed-averaged models) |
+| `plugin_adapter.py` | What Rishi's plug-in loads: the predictor and the stop policy, answering as the runtime's `standard` design, with every decision logged |
+| `live_monitor.py` | `status` of a live batch (progress, tokens, running score, alerts) and `report` after grading (scores, A/B differences, record checks) |
+| `plugin_rehearsal.py` | Rishi's real plug-in and the adapter on logged runs, nothing executed: the integration rehearsed offline |
 | `tool_ab_check.py` | Rishi's tool A/B runs (Qwen, 4 arms × 100 tasks) with the runtime's predictions, as trained and calibrated: prediction quality, each arm alone, controls, and each tool change against the baseline |
 
 ## Learned remaining cost: a trained component that beats the hand-made policies
@@ -1394,7 +1513,7 @@ levers above are information that arrives early and agent-level calibration.
 
 ## What this does not show yet
 
-- **Offline only.** Every number comes from replaying logged runs; live runs are the real test.
+- **Offline only.** Every number comes from replaying logged runs, the rehearsal through Rishi's real plug-in included; live runs are the real test.
 - **The balanced design's proof needs a second reader.** THEORY_BALANCED.md proves the
   `balanced` interval from standard results and every identity is checked numerically, but
   nobody has yet read it step by step. `runtime.py` defaults to the standard design, whose
@@ -1430,4 +1549,4 @@ levers above are information that arrives early and agent-level calibration.
   features' test-run patterns are Python-specific.
 - Nebius and CoderForge were tested as extra training data and did not help (see "Does more
   training data help?"); otherwise they are used to measure luck.
-- No result yet on Rishi's runs.
+- The reference-arm hint has not been tried on Rishi's tool changes yet.

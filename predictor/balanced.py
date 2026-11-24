@@ -59,7 +59,6 @@ from scipy.stats import t as student_t
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "coverage"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import stopping
-from cost_aware import pad
 from experiments import pad_runs
 
 FLOOR = 0.05
@@ -327,6 +326,10 @@ def simulate(job) -> list[dict]:
 
 
 def main() -> None:
+    # imported here, not at the top: runtime.py imports this module, and cost_aware's imports
+    # (train_lgbm, the stand-in predictor) need scikit-learn, which a live harness need not have
+    from cost_aware import pad
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--inputs", type=Path, default=Path("data/predictor/cost_aware_inputs.pkl"))
     parser.add_argument("--kappas", type=Path, default=Path(__file__).parent / "results" / "cost_aware.csv")
